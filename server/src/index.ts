@@ -231,7 +231,7 @@ async function main() {
   // doc redis channels here so two server instances stay convergent.
   bootDocumentBus()
 
-  server.listen(env.PORT, () => {
+  server.listen(env.PORT, '127.0.0.1', () => {
     console.log(`[boot] cumora server :${env.PORT} · instance ${env.INSTANCE_ID} · model ${env.OPENAI_MODEL}`)
   })
 
