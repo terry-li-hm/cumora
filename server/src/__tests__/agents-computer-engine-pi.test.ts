@@ -127,19 +127,26 @@ async function fakeLog(f: Fixture): Promise<Array<{ argv?: string[]; cmd?: { typ
   return (await readFile(f.log, 'utf8')).split('\n').filter(Boolean).map((l) => JSON.parse(l))
 }
 
-test('pi seedHome lays out AGENTS.md + .pi/skills and never clobbers an existing persona file', { skip: IS_WIN }, async () => {
+test('pi seedHome lays out AGENTS.md + .pi/skills and rewrites system-owned persona (chromatin eligibility)', { skip: IS_WIN }, async () => {
   const f = await fixture()
   const pi = getAdapter('pi')
-  await pi.seedHome(f.home, { id: 'a1', name: 'Iris', role: 'Designer' })
+  await pi.seedHome(f.home, { id: 'a1', name: 'Iris', role: 'Designer', systemPrompt: null })
   const agentsMd = await readFile(join(f.home, 'AGENTS.md'), 'utf8')
   assert.match(agentsMd, /^# Iris — Designer/)
   assert.match(agentsMd, /`AGENTS\.md` \(this file\)/, 'the header must name the file pi actually reads')
   assert.match(agentsMd, /`\.pi\/skills\/` — your skills/)
+  assert.doesNotMatch(agentsMd, /`chromatin\/`/, 'xAI/GLM pi pins do not get Chromatin')
   assert.ok(existsSync(join(f.home, '.pi', 'skills')))
   assert.ok(existsSync(join(f.home, 'memory', 'MEMORY.md')))
-  await writeFile(join(f.home, 'AGENTS.md'), 'edited by the agent', 'utf8')
-  await pi.seedHome(f.home, { id: 'a1', name: 'Iris', role: 'Designer' })
-  assert.equal(await readFile(join(f.home, 'AGENTS.md'), 'utf8'), 'edited by the agent')
+  assert.ok(!existsSync(join(f.home, 'chromatin')))
+
+  await pi.seedHome(f.home, {
+    id: 'a1', name: 'Iris', role: 'Designer', systemPrompt: null,
+    model: 'openai-codex/gpt-5.6-sol:high',
+  })
+  const rewritten = await readFile(join(f.home, 'AGENTS.md'), 'utf8')
+  assert.match(rewritten, /`chromatin\/` — the operator's note vault/)
+  assert.ok(existsSync(join(f.home, 'chromatin')), 'openai-codex pi pin gets the Chromatin symlink')
 })
 
 test('pi persistent session: one prompt → one turn, session id, summed usage, per-hop ledger report', { skip: IS_WIN }, async () => {

@@ -20,9 +20,9 @@
  */
 import { spawn, execFileSync, type ChildProcess } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import { mkdir, writeFile, access, mkdtemp } from 'node:fs/promises'
+import { mkdir, writeFile, access, mkdtemp, lstat, readlink, symlink, unlink } from 'node:fs/promises'
 import { existsSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { homedir, tmpdir } from 'node:os'
 import { join, delimiter as PATH_DELIMITER } from 'node:path'
 import { stripLoneSurrogates } from '../text-safety.js'
 
@@ -97,6 +97,8 @@ export interface EnginePersona {
   name: string
   role: string | null
   systemPrompt: string | null
+  /** Big-brain model pin when known (needed for pi openai-codex chromatin eligibility). */
+  model?: string | null
 }
 
 export interface EngineRunArgs {
@@ -361,6 +363,47 @@ async function ensureCommonHome(home: string): Promise<void> {
   }
 }
 
+/** Cleared BYOA lanes may browse the operator's Chromatin vault. Claude and
+ *  native Codex always qualify; pi qualifies only on the openai-codex
+ *  ChatGPT-subscription pin — never xAI/Grok or BigModel/GLM. */
+export function grantsChromatinAccess(engine: EngineId, model?: string | null): boolean {
+  if (engine === 'claude' || engine === 'codex') return true
+  if (engine === 'pi') return typeof model === 'string' && model.startsWith('openai-codex/')
+  return false
+}
+
+/** Symlink `home/chromatin` → `~/chromatin` when granted; remove a stale link
+ *  when not. Policy is read-browse: agents must not modify vault files or paste
+ *  long client excerpts into Cumora rooms (enforced in PERSONA_HEADER). */
+async function ensureChromatinLink(home: string, grant: boolean): Promise<void> {
+  const link = join(home, 'chromatin')
+  const target = join(homedir(), 'chromatin')
+  if (!grant) {
+    try {
+      const st = await lstat(link)
+      if (st.isSymbolicLink()) await unlink(link)
+    } catch { /* absent — fine */ }
+    return
+  }
+  try {
+    const st = await lstat(link)
+    if (st.isSymbolicLink()) {
+      const cur = await readlink(link)
+      if (cur === target) return
+      await unlink(link)
+    } else {
+      // Real dir/file at chromatin/ — do not clobber agent-owned content.
+      return
+    }
+  } catch { /* missing — create below */ }
+  try {
+    await access(target)
+  } catch {
+    return // vault absent on this host — skip rather than dangling
+  }
+  await symlink(target, link)
+}
+
 /** Shared spawn helper: run `bin args…` in `home`, stream lines to onLog,
  *  abort on signal, resolve with the exit code. */
 const MAX_FAILURE_LINES = 30
@@ -543,7 +586,7 @@ function extraArgs(envVar: string): string[] {
 
 /** Where an engine natively reads its persona file and skills from, so the
  *  header can name the right files. Defaults to Claude Code's layout. */
-interface HomeLayout { personaFile: string; skillsDir: string }
+interface HomeLayout { personaFile: string; skillsDir: string; chromatinAccess?: boolean }
 const CLAUDE_HOME_LAYOUT: HomeLayout = { personaFile: 'CLAUDE.md', skillsDir: '.claude/skills/' }
 
 const PERSONA_HEADER = (p: EnginePersona, layout: HomeLayout = CLAUDE_HOME_LAYOUT): string =>
@@ -562,7 +605,13 @@ const PERSONA_HEADER = (p: EnginePersona, layout: HomeLayout = CLAUDE_HOME_LAYOU
   `- \`${layout.skillsDir}\` — your skills.\n` +
   `- \`workspace/\` — **put all project files and scratch here**: git clones, builds,\n` +
   `  downloads, temp files. Always \`cd workspace\` (or use \`workspace/…\` paths) for\n` +
-  `  that work — do NOT clutter your home root with project files.\n\n` +
+  `  that work — do NOT clutter your home root with project files.\n` +
+  (layout.chromatinAccess
+    ? `- \`chromatin/\` — the operator's note vault (read-browse, including \`immunity/\`).\n` +
+      `  Use it to find and cite notes for the current task. Do NOT create, edit, move,\n` +
+      `  or delete files under \`chromatin/\`. Do NOT paste long excerpts or raw client /\n` +
+      `  employer text into Cumora rooms — summarize, and ask before quoting.\n\n`
+    : `\n`) +
   `## Privacy boundary — STRICT\n` +
   `You run on a machine that belongs to your operator. Everything OUTSIDE your home\n` +
   `directory (other projects, \`~/.ssh\`, credentials, browser data, personal files)\n` +
@@ -904,12 +953,17 @@ class ClaudeAdapter implements EngineAdapter {
 
   async seedHome(home: string, persona: EnginePersona): Promise<void> {
     await ensureCommonHome(home)
+    await ensureChromatinLink(home, grantsChromatinAccess('claude', persona.model))
     await mkdir(join(home, '.claude', 'skills'), { recursive: true })
     // Always (re)written from the DB's name/role/systemPrompt — this file is
     // system-owned, not agent-editable, so it's safe to overwrite on every
     // start()/restart (including the restart configMatches() triggers when
     // the operator edits the agent's persona in Cumora).
-    await writeFile(join(home, 'CLAUDE.md'), PERSONA_HEADER(persona), 'utf8')
+    await writeFile(
+      join(home, 'CLAUDE.md'),
+      PERSONA_HEADER(persona, { ...CLAUDE_HOME_LAYOUT, chromatinAccess: grantsChromatinAccess('claude', persona.model) }),
+      'utf8',
+    )
     // settings.json lets bash (hence the cumora shim) run without prompts in
     // this isolated home. Only written if absent so the user can customize.
     const settings = join(home, '.claude', 'settings.json')
@@ -1408,8 +1462,14 @@ class CodexAdapter implements EngineAdapter {
 
   async seedHome(home: string, persona: EnginePersona): Promise<void> {
     await ensureCommonHome(home)
+    const chromatinAccess = grantsChromatinAccess('codex', persona.model)
+    await ensureChromatinLink(home, chromatinAccess)
     // See ClaudeAdapter.seedHome: system-owned, safe to overwrite every start.
-    await writeFile(join(home, 'AGENTS.md'), PERSONA_HEADER(persona), 'utf8')
+    await writeFile(
+      join(home, 'AGENTS.md'),
+      PERSONA_HEADER(persona, { personaFile: 'AGENTS.md', skillsDir: '.claude/skills/', chromatinAccess }),
+      'utf8',
+    )
   }
 
   run(args: EngineRunArgs): Promise<EngineRunResult> {
@@ -1981,15 +2041,20 @@ class PiAdapter implements EngineAdapter {
 
   async seedHome(home: string, persona: EnginePersona): Promise<void> {
     await ensureCommonHome(home)
+    const chromatinAccess = grantsChromatinAccess('pi', persona.model)
+    await ensureChromatinLink(home, chromatinAccess)
     // pi discovers AGENTS.md from its cwd natively; skills under .pi/skills/ are
     // project-local resources, which pi's non-interactive modes IGNORE unless the
     // directory is trusted — so startSession() passes the dir explicitly via
     // --skill instead of trusting the whole home (see there).
     await mkdir(join(home, '.pi', 'skills'), { recursive: true })
-    const agentsMd = join(home, 'AGENTS.md')
-    if (!(await exists(agentsMd))) {
-      await writeFile(agentsMd, PERSONA_HEADER(persona, { personaFile: 'AGENTS.md', skillsDir: '.pi/skills/' }), 'utf8')
-    }
+    // Always rewrite AGENTS.md so chromatin eligibility and persona edits land
+    // without requiring a fresh home (matches Claude/Codex adapters).
+    await writeFile(
+      join(home, 'AGENTS.md'),
+      PERSONA_HEADER(persona, { personaFile: 'AGENTS.md', skillsDir: '.pi/skills/', chromatinAccess }),
+      'utf8',
+    )
   }
 
   async run(args: EngineRunArgs): Promise<EngineRunResult> {

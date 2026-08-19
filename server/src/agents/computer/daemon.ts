@@ -1083,7 +1083,13 @@ class AgentRunner {
   }
 
   async start(): Promise<void> {
-    await this.adapter.seedHome(this.home, { id: this.agent.id, name: this.agent.name, role: this.agent.role, systemPrompt: this.agent.systemPrompt })
+    await this.adapter.seedHome(this.home, {
+      id: this.agent.id,
+      name: this.agent.name,
+      role: this.agent.role,
+      systemPrompt: this.agent.systemPrompt,
+      model: this.agent.model,
+    })
     await writeShim(this.binDir)
     await this.loadSessionId()
     void this.streamLoop()
