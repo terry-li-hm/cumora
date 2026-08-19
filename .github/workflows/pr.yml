@@ -93,6 +93,43 @@ jobs:
     name: Unit tests
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # `npm test` (server/src/__tests__ + workers) boots env.ts and opens
+    # Postgres/Redis connections, so this job needs the same service
+    # containers + env as build.yml's quality job — without them tests
+    # hang on ECONNREFUSED until the job times out. Dummy secrets only;
+    # unit tests never reach a real provider. (pgvector isn't needed here —
+    # build.yml runs `npm test` before enabling the extension.)
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: cumora
+          POSTGRES_PASSWORD: cumora
+          POSTGRES_DB: cumora_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U cumora -d cumora_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://cumora:cumora@localhost:5432/cumora_test
+      REDIS_URL: redis://localhost:6379
+      RESEND_API_KEY: ''
+      EMAIL_DOMAIN: cumora.local
+      EMAIL_INBOUND_HMAC_SECRET: ci-test-secret
+      AUTH_SECRET: ci-test-auth-secret
+      OPENAI_API_KEY: ci-test-openai-key
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -100,6 +137,12 @@ jobs:
           node-version: '24'
           cache: 'npm'
       - run: npm ci
+      # `npm test` runs workers/**/*.test.ts too, and the email-gate
+      # worker has its own dependencies (postal-mime) that the root
+      # install doesn't pull in. Install them or those tests fail with
+      # "Cannot find module 'postal-mime'". Mirrors build.yml's quality job.
+      - name: Install Email Worker dependencies
+        run: npm ci --prefix workers/email-gate
       # `npm test` returns exit code 1 when the script is missing. We
       # want a soft no-op until tests exist — skip if there's no `test`
       # script in package.json. Once a test script is added, this job

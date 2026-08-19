@@ -26,7 +26,7 @@ import { execFile, spawn } from 'node:child_process'
 import { promisify } from 'node:util'
 
 const execFileP = promisify(execFile)
-import { parseSseStream } from '../runtime/sse-parse.js'
+import { parseSseStream, wakeStreamWasStable } from '../runtime/sse-parse.js'
 import { detectEngines, getAdapter, ENGINE_IDS, runEngineDoctor, type EngineId, type EngineSession, type EngineRunResult, type EngineUsage, type EngineHopReport } from './engine.js'
 import { usageFromClaude, type TokenUsage } from '../cost.js'
 import { parseTriage, finalizeTriage, isRateLimited } from '../triage-core.js'
@@ -300,6 +300,7 @@ interface AgentInfo {
   id: string
   name: string
   role: string | null
+  systemPrompt: string | null
   engine: EngineId | null
   model: string | null
   fastModel: string | null
@@ -318,6 +319,62 @@ interface RuntimeInboxResponse {
     kind?: string
     sequence?: number
   }>
+}
+
+// How many unread MESSAGE lines the pre-loaded wake digest may carry. It rides
+// in EVERY chat turn's prompt (see chatDelta), so it stays small.
+const DIGEST_MAX_MESSAGE_LINES = 40
+
+/** Render the pre-loaded unread digest for the wake prompt within
+ *  DIGEST_MAX_MESSAGE_LINES.
+ *
+ *  The budget is spent PER CONVERSATION rather than as one global "newest N
+ *  lines" tail, because `ackSeen` marks the WHOLE snapshot read: anything the
+ *  digest leaves out is marked read having never been shown, and since
+ *  mark-read pins each conversation's cursor at its NEWEST message it can never
+ *  resurface in a later wake. A global tail let a burst in one busy room evict —
+ *  and then ack away — every message of a quieter conversation, including a
+ *  human DM the agent could not even name afterwards. The cloud path avoids this
+ *  by giving every conversation with unread its own window (see loadContext).
+ *
+ *  Whatever the budget still cannot fit is announced IN PLACE with its exact
+ *  count and the command that reads it, so the engine can recover the rest
+ *  instead of never learning it existed. Conversations keep first-seen order and
+ *  their messages stay chronological; when everything fits, every unread line is
+ *  shown, exactly as before.
+ *
+ *  Exported for tests — pure, no server and no engine. */
+export function renderInboxDigest(
+  byConvo: Map<string, { head: string; msgs: string[] }>,
+  budget = DIGEST_MAX_MESSAGE_LINES,
+): string {
+  if (byConvo.size === 0) return ''
+  // Water-fill quietest-first: each conversation takes at most an even share of
+  // what is LEFT, so a small conversation keeps all of its messages and the busy
+  // one absorbs the slack. When the total fits, this hands every conversation
+  // its full set (nothing omitted, nothing announced).
+  const keep = new Map<string, number>()
+  let lineBudget = budget
+  let unserved = byConvo.size
+  for (const [id, convo] of [...byConvo].sort((a, b) => a[1].msgs.length - b[1].msgs.length)) {
+    const n = Math.min(convo.msgs.length, Math.max(0, Math.floor(lineBudget / unserved)))
+    keep.set(id, n)
+    lineBudget -= n
+    unserved -= 1
+  }
+  const lines: string[] = []
+  for (const [id, convo] of byConvo) {
+    const shown = keep.get(id) ?? 0
+    lines.push(convo.head)
+    // Never drop unread in SILENCE — this turn is about to mark it read.
+    if (convo.msgs.length > shown) {
+      lines.push(`  … ${convo.msgs.length - shown} older unread message(s) not shown — \`cumora messages ${id} --tail ${convo.msgs.length}\` to read them`)
+    }
+    // slice(length - shown), NOT slice(-shown): slice(-0) is slice(0) and would
+    // print everything for a conversation budgeted to zero.
+    lines.push(...convo.msgs.slice(convo.msgs.length - shown))
+  }
+  return lines.join('\n')
 }
 
 interface RuntimeInboxTriageResponse {
@@ -432,6 +489,60 @@ const CONTEXT_OVERFLOW_RE = /context window|context length|context_length_exceed
 // also scrub outgoing text (engine.ts stripLoneSurrogates) so we stop creating it.
 const POISONED_BODY_RE = /no (?:low|high) surrogate|unpaired surrogate|lone surrogate|surrogate in string|request body is not valid json/i
 
+// A STALE resume target: we passed `--resume <id>` and the engine says it has no
+// such session. Dropping the id is the right recovery — the next wake starts a
+// fresh session instead of re-failing against a target that no longer exists.
+//
+// Every branch pairs the noun with FAILURE wording. A bare mention of a session
+// or conversation proves nothing: the engine's own event stream is full of them
+// (see `engineDiagnosticProse`), so matching the noun alone turned every
+// mid-turn engine death into a "stale resume target" and threw away the session
+// id that exists to recover the interrupted turn.
+const STALE_RESUME_RE = new RegExp([
+  // "No conversation found with session ID: …", "no such session"
+  String.raw`\bno (?:such )?(?:\w+ )?(?:conversation|session|thread)\b`,
+  // "Session not found", "conversation no longer exists", "thread has expired"
+  String.raw`\b(?:conversation|session|thread)(?: id)?\b[^\n]{0,24}?\b(?:not found|no longer exists?|does not exist|doesn't exist|has expired|is expired|is invalid|is unknown)\b`,
+  // "Invalid session id", "unknown conversation", "expired thread"
+  String.raw`\b(?:invalid|unknown|expired|stale|malformed) (?:\w+ )?(?:conversation|session|thread)\b`,
+  // "could not resume", "unable to resume this conversation", "failed to resume"
+  String.raw`\b(?:could ?n(?:o|')?t|cannot|can't|unable to|failed to)\b[^\n]{0,24}?\bresume\b`,
+  // codex app-server's own wording
+  String.raw`\bthread/resume failed\b`,
+].join('|'), 'i')
+
+/** The human-readable part of an engine failure blob.
+ *
+ *  `failurePreview` (engine.ts) appends the tail of the engine's STDOUT to the
+ *  error text, and on the Claude path that stdout is stream-json: EVERY event
+ *  line carries a `"session_id"` field. Those lines are machine structure, not
+ *  diagnosis, so pattern-matching them as prose is what produced the false
+ *  "stale resume target" verdict on any mid-turn death. Keep an event line's
+ *  error text (that IS diagnosis) and drop everything else about it. */
+export function engineDiagnosticProse(err: string): string {
+  const out: string[] = []
+  for (const line of err.split('\n')) {
+    const trimmed = line.trim()
+    if (!trimmed.startsWith('{')) { out.push(line); continue }
+    let ev: { is_error?: unknown; result?: unknown; error?: unknown }
+    try { ev = JSON.parse(trimmed) } catch { continue }
+    // `result` is prose only on a FAILED turn; on a successful one it's the
+    // agent's own answer, which must never be read as an engine diagnosis.
+    if (ev.is_error === true && typeof ev.result === 'string') out.push(ev.result)
+    if (typeof ev.error === 'string') out.push(ev.error)
+    else if (ev.error && typeof ev.error === 'object') {
+      const m = (ev.error as { message?: unknown }).message
+      if (typeof m === 'string') out.push(m)
+    }
+  }
+  return out.join('\n')
+}
+
+/** True when an engine error really says the `--resume` target is gone. */
+export function isStaleResumeError(err: string): boolean {
+  return STALE_RESUME_RE.test(engineDiagnosticProse(err))
+}
+
 function authFailureHint(engine: EngineId, detail: string): string {
   if (CONTEXT_OVERFLOW_RE.test(detail)) {
     return 'The agent filled up its context window. Its session has been reset automatically — just wake the agent again and it will start fresh.'
@@ -523,7 +634,10 @@ async function saveConfig(cfg: DaemonConfig): Promise<void> {
 // A tiny Node executable named `cumora` that the engine calls via bash. It
 // POSTs argv to the server's /runtime/cli, which runs the full CLI server-
 // side with the agent's identity pinned by the JWT. No curl/jq dependency.
-const CUMORA_SHIM = `#!/usr/bin/env node
+//
+// Exported for tests: the output-truncation regression below is only observable
+// by running the real shim text against a real pipe.
+export const CUMORA_SHIM = `#!/usr/bin/env node
 'use strict'
 ;(async () => {
   const url = process.env.CUMORA_AGENT_RUNTIME_URL
@@ -539,20 +653,27 @@ const CUMORA_SHIM = `#!/usr/bin/env node
   // is mangled by bash BEFORE this shim runs: backticks and $(...) get run as
   // commands and collapse to empty, quotes get eaten. So --file <path> /
   // --stdin let the body come from a file (written by the editor, no shell) or
-  // a pipe; we read it LOCALLY and splice it in as one argument that travels as
+  // a pipe; we read it LOCALLY and pass it as one argument that travels as
   // JSON and is never re-parsed by a shell, so code/quotes/$ survive verbatim.
+  //
+  // It goes LAST, behind a POSIX \`--\`, so the server takes it literally. Spliced
+  // in place it was still read as argv: a body starting with \`---\` (markdown
+  // rule, front-matter fence, diff header) parsed as a FLAG and the message was
+  // silently dropped, and escapes inside it were expanded a second time.
   var fs = require('fs')
+  var body = null
   var fi = argv.indexOf('--file')
   if (fi >= 0 && argv[fi + 1] !== undefined) {
-    try { argv.splice(fi, 2, fs.readFileSync(argv[fi + 1], 'utf8')) }
+    try { body = fs.readFileSync(argv[fi + 1], 'utf8') }
     catch (e) { console.error('cumora: cannot read --file ' + argv[fi + 1]); process.exit(70) }
+    argv.splice(fi, 2)
   }
   var si = argv.indexOf('--stdin')
   if (si >= 0) {
-    var s = ''
-    try { s = fs.readFileSync(0, 'utf8') } catch (e) {}
-    argv.splice(si, 1, s)
+    argv.splice(si, 1)
+    if (body === null) { try { body = fs.readFileSync(0, 'utf8') } catch (e) { body = '' } }
   }
+  if (body !== null) argv.push('--', body)
   const res = await fetch(url + '/cli', {
     method: 'POST',
     headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' },
@@ -564,8 +685,18 @@ const CUMORA_SHIM = `#!/usr/bin/env node
     process.exit(70)
   }
   const data = await res.json()
-  if (typeof data.text === 'string' && data.text) process.stdout.write(data.text + '\\n')
-  process.exit(typeof data.exitCode === 'number' ? data.exitCode : 0)
+  const code = typeof data.exitCode === 'number' ? data.exitCode : 0
+  // Exit from the write CALLBACK, not the next statement: stdout on a PIPE is
+  // ASYNC, so process.exit() kills us with the tail still buffered. The engine
+  // always runs this shim with stdout piped, so a big result (cumora messages
+  // --tail 30, cumora inbox --json) silently arrived truncated at the pipe
+  // buffer — 64KB, or 8KB on the socketpair a stdio:'pipe' parent hands us —
+  // with exit 0 and empty stderr, so nothing signalled the loss and --json
+  // output simply failed to parse. Exiting IN the callback also keeps a reader
+  // that closed early (| head) an exit-0 like before, instead of the unhandled
+  // EPIPE crash a bare process.exitCode would produce.
+  if (typeof data.text === 'string' && data.text) process.stdout.write(data.text + '\\n', () => process.exit(code))
+  else process.exit(code)
 })().catch((e) => { console.error('cumora:', (e && e.message) || e); process.exit(70) })
 `
 
@@ -717,6 +848,48 @@ class HopReporter {
   }
 }
 
+/** CUMORA_ENGINE_MODEL value meaning "impose no model at all — use whatever
+ *  the local CLI is already configured for". */
+const ENGINE_MODEL_LOCAL = 'local'
+
+/** The model the LOCAL engine should run this agent's turns on.
+ *
+ *  Cumora pins a model per agent (participants.model, else the deploy-level
+ *  CUMORA_DEFAULT_* default) so a CLI upgrade can't silently change behaviour.
+ *  That pin is an Anthropic/OpenAI model id — which is simply wrong for a BYOA
+ *  operator whose `claude` points at a custom provider (CC Switch and friends):
+ *  the provider has never heard of e.g. `claude-opus-4-7`, so EVERY turn dies
+ *  with "There's an issue with the selected model". The pin is resolved
+ *  server-side, so on hosted Cumora the operator cannot change it, and their
+ *  only escape was CUMORA_CLAUDE_ARGS — which also disables the persistent
+ *  session and makes them hand-write the entire flag set.
+ *
+ *  CUMORA_ENGINE_MODEL overrides the pin daemon-side. The value `local` passes
+ *  NO model at all, so the CLI runs on whatever it is already configured for —
+ *  the same escape CUMORA_TRIAGE_MODEL already gives the small brain.
+ *
+ *  Exported for tests. */
+export function resolveEngineModel(
+  configured: string | null | undefined,
+  override: string | undefined,
+): string | null {
+  const o = override?.trim()
+  if (!o) return configured ?? null
+  return o.toLowerCase() === ENGINE_MODEL_LOCAL ? null : o
+}
+
+/** The same knob governs the small-brain pin. `local` has to impose NOTHING:
+ *  otherwise ANTHROPIC_SMALL_FAST_MODEL would still name a model the custom
+ *  provider lacks, and the CLI's own quick calls would fail instead of the turn.
+ *  A concrete override only replaces the big-brain pin, so fast_model is left
+ *  alone there. */
+export function resolveEngineFastModel(
+  configured: string | null | undefined,
+  override: string | undefined,
+): string | null {
+  return override?.trim().toLowerCase() === ENGINE_MODEL_LOCAL ? null : (configured ?? null)
+}
+
 class AgentRunner {
   private token = ''
   private tokenExpiresAt = 0
@@ -853,11 +1026,14 @@ class AgentRunner {
    *      we drop it. This is hadResume-independent: even a single resumed session
    *      that's now too big must be abandoned.
    *   2. STALE / MISSING resume target — we tried to --resume a session the
-   *      engine no longer has. Only meaningful when we actually passed one. */
+   *      engine no longer has. Only meaningful when we actually passed one, and
+   *      only when the engine SAYS SO: a mid-turn crash (OOM, sleep, provider
+   *      hangup) leaves a resumable session, so it must NOT reset — that would
+   *      discard the context the interrupted turn was building. */
   private mustResetSession(err: string, hadResume: boolean): boolean {
     if (this.isContextOverflow(err)) return true
     if (this.isPoisonedTranscript(err)) return true
-    if (hadResume && /resume|session|conversation/i.test(err)) return true
+    if (hadResume && isStaleResumeError(err)) return true
     return false
   }
 
@@ -907,7 +1083,7 @@ class AgentRunner {
   }
 
   async start(): Promise<void> {
-    await this.adapter.seedHome(this.home, { id: this.agent.id, name: this.agent.name, role: this.agent.role })
+    await this.adapter.seedHome(this.home, { id: this.agent.id, name: this.agent.name, role: this.agent.role, systemPrompt: this.agent.systemPrompt })
     await writeShim(this.binDir)
     await this.loadSessionId()
     void this.streamLoop()
@@ -944,6 +1120,7 @@ class AgentRunner {
     return this.adapter.id === engine
       && this.agent.name === agent.name
       && this.agent.role === agent.role
+      && this.agent.systemPrompt === agent.systemPrompt
       && this.agent.model === agent.model
       && this.agent.fastModel === agent.fastModel
   }
@@ -964,6 +1141,16 @@ class AgentRunner {
 
   /** Env handed to the engine subprocess: the `cumora` shim on PATH, wired to
    *  this agent's runtime URL + token. */
+  /** Big-brain model for the local engine, after the CUMORA_ENGINE_MODEL escape. */
+  private engineModel(): string | null {
+    return resolveEngineModel(this.agent.model, process.env.CUMORA_ENGINE_MODEL)
+  }
+
+  /** Small/fast-brain model for the local engine, after the same escape. */
+  private engineFastModel(): string | null {
+    return resolveEngineFastModel(this.agent.fastModel, process.env.CUMORA_ENGINE_MODEL)
+  }
+
   private engineEnv(): NodeJS.ProcessEnv {
     return {
       ...process.env,
@@ -989,8 +1176,8 @@ class AgentRunner {
     this.engineSession = this.adapter.startSession({
       home: this.home,
       env: this.engineEnv(),
-      model: this.agent.model,
-      fastModel: this.agent.fastModel,
+      model: this.engineModel(),
+      fastModel: this.engineFastModel(),
       resumeSessionId: this.sessionId,
       standingPrompt: this.standingPrompt(),
       onLog: (line) => this.logEngineLine(line),
@@ -1248,16 +1435,17 @@ class AgentRunner {
   private async snapshotUnread(token: string): Promise<{ seen: Map<string, string>; digest: string; hasReal: boolean }> {
     const inbox = await runtimeGet<RuntimeInboxResponse>(this.cfg.serverUrl, '/inbox', token)
     const seen = new Map<string, string>()
-    const lines: string[] = []
+    // Unread grouped BY CONVERSATION (first-seen order), each with the header
+    // (title + topic) the cloud agent's context also carries — so a BYOA agent
+    // always sees what the group is FOR (its topic), not just the messages.
+    // Grouped rather than one flat line list because the digest has a LINE
+    // BUDGET, and spending it per conversation is what stops a busy room from
+    // evicting — and `ackSeen` then burying — a quiet one. See renderInboxDigest.
+    const byConvo = new Map<string, { head: string; msgs: string[] }>()
     // `hasReal` = is ANY unread a genuine human/agent message (not a system
     // relay/status/membership notice)? The cost gate in runTurn uses this to
     // refuse to spend ANY model on a system-only (or empty) inbox.
     let hasReal = false
-    // Emit a per-conversation header (title + topic) the first time each convo
-    // appears, mirroring the cloud agent's context header — so a BYOA agent
-    // always sees what the group is FOR (its topic) while chatting, not just the
-    // messages.
-    const headered = new Set<string>()
     // rows are ordered created_at ASC, so the last row per conversation is its
     // newest unread message — exactly the cursor we want to advance to.
     for (const row of inbox?.rows ?? []) {
@@ -1268,13 +1456,14 @@ class AgentRunner {
       // engine (the cloud path special-cases these system rows the same way).
       const alarm = row.kind === 'system' && typeof row.body === 'string' ? this.parseAlarmPayload(row.body) : null
       if (row.kind !== 'system' || (alarm && (!alarm.assigneeId || alarm.assigneeId === this.agent.id))) hasReal = true
-      if (!headered.has(row.conversation_id)) {
-        headered.add(row.conversation_id)
+      let convo = byConvo.get(row.conversation_id)
+      if (!convo) {
         const kind = row.conversation_kind ? ` [${row.conversation_kind}]` : ''
         const title = row.conversation_title ? ` "${row.conversation_title}"` : ''
         let head = `# ${row.conversation_id}${kind}${title}`
         if (row.conversation_topic) head += `\n  Topic: ${row.conversation_topic}`
-        lines.push(head)
+        convo = { head, msgs: [] }
+        byConvo.set(row.conversation_id, convo)
       }
       const author = row.author_name ?? 'someone'
       const who = row.author_kind ? `${author} (${row.author_kind})` : author
@@ -1286,10 +1475,9 @@ class AgentRunner {
       // Keep the message id + convo id on each line (like the cloud agent's
       // context) so the engine can QUOTE the exact message: `cumora reply
       // <convo> '<body>' --quote <message_id>`.
-      lines.push(`  [${row.id}] ${row.conversation_id}  ${who}: ${body}`)
+      convo.msgs.push(`  [${row.id}] ${row.conversation_id}  ${who}: ${body}`)
     }
-    const digest = lines.length ? lines.slice(-40).join('\n') : ''
-    return { seen, digest, hasReal }
+    return { seen, digest: renderInboxDigest(byConvo), hasReal }
   }
 
   /** Advance this agent's read cursor over the conversations it just saw, so a
@@ -1494,7 +1682,7 @@ class AgentRunner {
         ? await session.send(prompt)
         : await this.adapter.run({
           home: this.home, prompt, env: this.engineEnv(),
-          model: this.agent.model, fastModel: this.agent.fastModel,
+          model: this.engineModel(), fastModel: this.engineFastModel(),
           resumeSessionId: this.sessionId, onLog: (line) => this.logEngineLine(line),
           // Same trajectory hook as the persistent-session path so the
           // one-shot fallback (or codex `exec` path) also lands hops in the
@@ -1864,8 +2052,8 @@ class AgentRunner {
               home: this.home,
               prompt,
               env: this.engineEnv(),
-              model: this.agent.model,
-              fastModel: this.agent.fastModel,
+              model: this.engineModel(),
+              fastModel: this.engineFastModel(),
               resumeSessionId,
               onLog: (line) => this.logEngineLine(line),
               onHopUsage: (r) => this.onEngineHop(r, 'agent-turn'),
@@ -1979,6 +2167,7 @@ class AgentRunner {
   private async streamLoop(): Promise<void> {
     let backoff = 1000
     while (!this.stopped) {
+      let connectedAt: number | null = null
       try {
         const token = await this.ensureToken()
         const res = await fetch(`${this.cfg.serverUrl}/runtime/wake-stream`, {
@@ -1986,7 +2175,7 @@ class AgentRunner {
         })
         if (!res.ok || !res.body) throw new Error(`wake-stream HTTP ${res.status}`)
         console.log(`[computer] ${this.agent.id} wake-stream connected (engine: ${this.adapter.id})`)
-        backoff = 1000
+        connectedAt = Date.now()
         this.kickTurn('reconnect-catchup') // cold-start / reconnect catch-up
         for await (const evt of parseSseStream(res.body as unknown as AsyncIterable<unknown>)) {
           if (this.stopped) break
@@ -2015,13 +2204,25 @@ class AgentRunner {
           }
           // 'ready' is a no-op keepalive.
         }
+        // The stream ended WITHOUT throwing — a clean server-side close. This
+        // used to fall straight back to the loop head and re-fetch with ZERO
+        // delay, re-firing reconnect-catchup every pass: measured at ~15k
+        // requests/second against the API from the operator's own machine.
+        if (!this.stopped) {
+          console.warn(`[computer] ${this.agent.id} wake-stream closed by server · retry in ${backoff}ms`)
+        }
       } catch (err) {
         if (this.stopped) break
         const _cause = (err as { cause?: { code?: string; message?: string } } | null)?.cause
         console.warn(`[computer] ${this.agent.id} stream error: ${err instanceof Error ? err.message : err}${_cause ? ` cause=${_cause.code ?? _cause.message ?? JSON.stringify(_cause)}` : ''} · retry in ${backoff}ms`)
-        await new Promise((r) => setTimeout(r, backoff))
-        backoff = Math.min(backoff * 2, 30_000)
       }
+      if (this.stopped) break
+      // BOTH exits back off. Reset the ladder only after a connection that
+      // actually stayed up — a 200 that closes immediately must not reset it, or
+      // the delay can never grow away from a pathological endpoint.
+      if (wakeStreamWasStable(connectedAt === null ? null : Date.now() - connectedAt)) backoff = 1000
+      await new Promise((r) => setTimeout(r, backoff))
+      backoff = Math.min(backoff * 2, 30_000)
     }
   }
 }

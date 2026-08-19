@@ -9,6 +9,12 @@ import { getAuthToken, getActiveCompanyId, useAuth } from '@/stores/auth'
 const DEVTOOLS_KEY = 'cumora.devtools.enabled'
 const SERVER_URL_KEY = 'cumora.serverUrl'
 
+// Vite's relative proxy keeps browser requests same-origin, but the pairing
+// command runs outside the browser and must address the API directly.
+const DEV_API_TARGET = import.meta.env.DEV
+  ? (import.meta.env.VITE_CUMORA_DEV_API_TARGET as string | undefined)?.replace(/\/+$/, '')
+  : undefined
+
 /** Resolve the API base. Three layers, highest priority first:
  *    1. localStorage['cumora.serverUrl'] — runtime override, settable
  *       from the dev console: `localStorage.setItem('cumora.serverUrl',
@@ -41,6 +47,13 @@ const API = `${SERVER_ORIGIN}/api`
  *  through the Vite proxy or same-origin." */
 export function getServerOrigin(): string {
   return SERVER_ORIGIN
+}
+
+/** Origin to embed in a local computer pairing command.
+ * In Vite dev the browser uses a relative proxy, so SERVER_ORIGIN is empty;
+ * the daemon still needs the API target rather than the renderer origin. */
+export function getPairingServerOrigin(): string {
+  return SERVER_ORIGIN || DEV_API_TARGET || ''
 }
 
 /** Persist a new server origin override and clear the existing session.
@@ -80,6 +93,13 @@ export function setDevModeEnabled(enabled: boolean): void {
   else localStorage.removeItem(DEVTOOLS_KEY)
 }
 
+export class ApiError extends Error {
+  constructor(message: string, readonly status: number) {
+    super(message)
+    this.name = 'ApiError'
+  }
+}
+
 export async function http<T>(path: string, init?: RequestInit): Promise<T> {
   const headers: Record<string, string> = { 'content-type': 'application/json' }
   const token = getAuthToken()
@@ -109,7 +129,7 @@ export async function http<T>(path: string, init?: RequestInit): Promise<T> {
         } catch { detail = text.slice(0, 200) }
       }
     } catch { /* ignore */ }
-    throw new Error(detail ? `${detail} (${res.status})` : `${res.status} ${res.statusText}`)
+    throw new ApiError(detail ? `${detail} (${res.status})` : `${res.status} ${res.statusText}`, res.status)
   }
   return res.json() as Promise<T>
 }
@@ -1009,10 +1029,9 @@ export const api = {
     body: string,
     attachment?: ApiAttachment | null,
     quotedMessageId?: string | null,
-    /** Optional client-supplied dedup key (the optimistic bubble's tempId).
-     *  Server echoes it on CH_MESSAGE_NEW so the renderer can match the WS
-     *  echo to its still-temp local bubble even when the WS event arrives
-     *  before this POST resolves. */
+    /** Optional client-supplied idempotency key (the optimistic bubble's
+     *  tempId). The server persists it and returns the original message when
+     *  the same send is retried. */
     clientId?: string | null,
   ) =>
     http<{ id: string; sequence: number }>(`/conversations/${encodeURIComponent(conversationId)}/messages`, {
@@ -1464,8 +1483,27 @@ class WsClient {
   private listeners = new Set<Listener>()
   private reconnectDelay = 500
   private intentionalClose = false
+  /** In-flight `connect()` de-dupe. The `this.ws` guard below cannot catch a
+   *  second caller: `this.ws` is not assigned until AFTER the ticket fetch
+   *  awaits, and boot fires five connects in the same tick
+   *  (bootMessagesStream / bootParticipants / bootConversations /
+   *  bootWhispers / bootComputers, each behind its own module-local `wsBound`
+   *  flag, so none of them suppresses another). Every socket they opened fanned
+   *  into this same `listeners` set, and since `message.delta` is applied by
+   *  ACCUMULATING onto the body, the streaming bubble rendered each chunk five
+   *  times while an agent typed. Concurrent callers ride the first attempt; the
+   *  memo clears once it settles, so a later connect still gets a fresh socket. */
+  private connecting: Promise<void> | null = null
 
-  async connect() {
+  connect(): Promise<void> {
+    const existing = this.connecting
+    if (existing) return existing
+    const p = this.connectImpl().finally(() => { this.connecting = null })
+    this.connecting = p
+    return p
+  }
+
+  private async connectImpl() {
     if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) return
     const token = getAuthToken()
     if (!token) return  // not signed in → don't even try
@@ -1490,19 +1528,27 @@ class WsClient {
       return
     }
     const url = `${wsOrigin()}/ws?t=${encodeURIComponent(ticket)}`
-    this.ws = new WebSocket(url)
-    this.ws.onopen = () => { this.reconnectDelay = 500 }
-    this.ws.onmessage = (ev) => {
+    const sock = new WebSocket(url)
+    this.ws = sock
+    sock.onopen = () => { this.reconnectDelay = 500 }
+    sock.onmessage = (ev) => {
       try {
         const data = JSON.parse(ev.data) as WsEvent
         this.listeners.forEach((l) => { l(data) })
       } catch { /* ignore */ }
     }
-    this.ws.onclose = () => {
+    sock.onclose = () => {
+      // Only the socket that is still CURRENT may clear the field. `reconnect()`
+      // closes the old socket and opens its replacement immediately, but the
+      // close event lands a tick later — nulling `this.ws` then would orphan a
+      // LIVE socket (`isOpen()`/`send()` start reporting closed while typing
+      // frames are silently dropped) and schedule a second one on top of it,
+      // putting us back to two sockets sharing one listener set.
+      if (this.ws !== sock) return
       this.ws = null
       if (!this.intentionalClose) this.scheduleReconnect()
     }
-    this.ws.onerror = () => { /* onclose follows */ }
+    sock.onerror = () => { /* onclose follows */ }
   }
 
   private scheduleReconnect() {

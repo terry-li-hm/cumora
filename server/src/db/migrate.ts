@@ -29,10 +29,13 @@ CREATE TABLE IF NOT EXISTS messages (
   reactions       JSONB,
   tool            JSONB,
   attachment      JSONB,
+  client_id       TEXT,
   created_at      TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_messages_convo_seq ON messages(conversation_id, sequence);
 CREATE INDEX IF NOT EXISTS idx_messages_convo_created ON messages(conversation_id, created_at);
+
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS client_id TEXT;
 
 -- Reply-to / quote target. Soft self-FK (no ON DELETE CASCADE) so deleting
 -- the original leaves replies as orphans rendered as "[deleted]" stubs
@@ -2078,6 +2081,7 @@ export async function ensureSchema(): Promise<void> {
         CREATE UNIQUE INDEX IF NOT EXISTS participants_agent_id_unique
           ON participants(id) WHERE kind = 'agent'
       `)
+      await ensureMessageClientIdIndex(client)
 
         console.log('[db] schema ensured')
       } catch (e) {
@@ -2101,8 +2105,36 @@ export async function ensureSchema(): Promise<void> {
     // lock). Best-effort + non-fatal — see the helper.
     await buildConcurrentIndexes(client)
   } finally {
-    client.release()
+    await releaseMigrationClient(client)
   }
+}
+
+/** The subset of a pooled client this helper needs — structural so a test can
+ *  hand it a fake without a live Postgres. */
+type MigrationClient = { query(sql: string): Promise<unknown>; release(): void }
+
+/**
+ * Hand the migration client back to the shared pool with its SESSION state wiped.
+ *
+ * ensureSchema deliberately turns OFF this session's `statement_timeout` and
+ * `idle_in_transaction_session_timeout` and sets `lock_timeout = '5s'`. All three
+ * are SESSION-scoped, and this client is an ordinary member of the 20-slot pool:
+ * `pg-pool`'s `release()` does not reset session state, and node-postgres sends
+ * the pool's timeouts only in the connection's STARTUP PACKET, so they are never
+ * re-applied on checkout. Without this reset, one pooled connection spends the
+ * rest of the process's life with the pool's runaway-query guards disabled — the
+ * very protection whose absence once let a single un-indexed query hold all 20
+ * slots and 503 the API (see db/pool.ts) — and with a 5s `lock_timeout` that
+ * aborts ordinary writes with `55P03` instead of waiting. Same "re-enter the pool
+ * with no leftover state" reasoning as the advisory unlock above.
+ *
+ * A failed RESET must never strand the slot, so we release either way; a
+ * genuinely broken connection is discarded by the pool on its own.
+ */
+export async function releaseMigrationClient(client: MigrationClient): Promise<void> {
+  try { await client.query('RESET ALL') }
+  catch { /* connection already unusable — releasing still returns the slot */ }
+  client.release()
 }
 
 /**
@@ -2130,6 +2162,13 @@ async function schemaAlreadyCurrent(client: import('pg').PoolClient): Promise<bo
         AND (SELECT count(*) FROM information_schema.columns
                WHERE table_name = 'participants' AND column_name = 'company_id') > 0
         AND (SELECT count(*) FROM pg_class WHERE relname = 'participants_agent_id_unique') > 0
+        AND (SELECT count(*) FROM information_schema.columns
+               WHERE table_name = 'messages' AND column_name = 'client_id') > 0
+        AND EXISTS (
+          SELECT 1 FROM pg_class c
+          JOIN pg_index i ON i.indexrelid = c.oid
+          WHERE c.relname = 'uniq_messages_client_id' AND i.indisvalid
+        )
         -- llm_calls is the universal sub2api ledger added in the observability
         -- rollout (29155c5). Without this sentinel, a 40P01 deadlock on the big
         -- DDL batch would take the "already current" shortcut and silently
@@ -2154,6 +2193,26 @@ async function schemaAlreadyCurrent(client: import('pg').PoolClient): Promise<bo
     return rows[0]?.ok === true
   } catch {
     return false
+  }
+}
+
+/** Correctness index for message idempotency. Build it concurrently so adding
+ *  the feature cannot block writes to the hot messages table. */
+async function ensureMessageClientIdIndex(client: import('pg').PoolClient): Promise<void> {
+  const { rows } = await client.query<{ indisvalid: boolean }>(
+    `SELECT i.indisvalid FROM pg_class c
+       JOIN pg_index i ON i.indexrelid = c.oid
+      WHERE c.relname = 'uniq_messages_client_id'`,
+  )
+  if (rows[0]?.indisvalid) return
+  await client.query("SET lock_timeout = '0'")
+  try {
+    if (rows[0]) await client.query('DROP INDEX CONCURRENTLY IF EXISTS uniq_messages_client_id')
+    await client.query(`CREATE UNIQUE INDEX CONCURRENTLY uniq_messages_client_id
+      ON messages(conversation_id, author_id, client_id)
+      WHERE client_id IS NOT NULL`)
+  } finally {
+    await client.query("SET lock_timeout = '5s'")
   }
 }
 

@@ -6,6 +6,14 @@
 
 Cumora is cross-platform team chat where AI agents are first-class participants alongside humans — same roster, same DMs, same group conversations, same Kanban board and calendar. Agents don't just answer when poked: they hold personas and memory, claim work, coordinate with each other without colliding, send and receive real email, and run on either Cumora's cloud or your own machine.
 
+<p align="center">
+  <img src="website/assets/product-screenshot.png" alt="Cumora desktop app — a team room where AI agents and humans discuss product design together" />
+</p>
+
+<p align="center">
+  <img src="website/assets/mobile-screenshot.png" alt="Cumora iOS app — the same conversations, agents, and humans on mobile" width="340" />
+</p>
+
 Two "brain" paths:
 
 - **Cumora Cloud** — each agent runs in a managed per-agent pod; turns run a multi-hop tool-calling loop on the OpenAI Responses API (bash, files, browser, email, memory, skills…).
@@ -14,7 +22,7 @@ Two "brain" paths:
 ## Architecture
 
 ```
- Electron / PWA / iOS / Android          ┌─────────────────┐
+ Electron / PWA / iOS / Android         ┌─────────────────┐
  ┌──────────────────┐   HTTP / WS       │   App workers   │──▶ OpenAI (Responses API)
  │    React UI      │ ◀───────────────▶ │  Express + ws   │──▶ Resend (email out)
  └──────────────────┘                   │    (any N)      │──▶ APNs / FCM (push)
@@ -39,7 +47,7 @@ You need Postgres and Redis (Homebrew services are fine):
 createdb -h localhost cumora
 export OPENAI_API_KEY=sk-...
 
-npm install
+npm run setup          # install root + Email Worker dependencies
 npm run dev:all       # Vite renderer on :5180 + API server on :5181
 ```
 

@@ -49,21 +49,39 @@ const CODEX_LOG_RAW = process.env.CUMORA_CODEX_VERBOSE === '1'
  *    code 1". Resolve the real file on PATH and run a `.cmd`/`.bat` via
  *    shell:true. When the shell is needed,
  *    a big multi-line prompt must travel via STDIN, not argv (the shell can't carry
- *    it) → `wantsStdinPrompt`. */
-function resolveSpawn(bin: string): { command: string; shell: boolean; wantsStdinPrompt: boolean } {
+ *    it) → `wantsStdinPrompt`.
+ *
+ *  Windows + nvm-windows gotcha: global npm CLIs are shipped as an extensionless
+ *  POSIX shell-shim (`#!/bin/sh` wrapper) ALONGSIDE the real `.cmd`. The old loop
+ *  iterated `['', ...PATHEXT]`, hit the shim first, classified it as non-batch,
+ *  and returned `shell:false` → every Claude/Codex turn died with ENOENT.
+ *  Fix: prefer a real `.exe`/`.cmd`/`.bat` hit; only fall back to the shim with
+ *  `shell:true` when nothing else is on PATH. */
+// Exported for tests; the nvm-windows extensionless-shim regression (issue #5)
+// needs a stable handle to the resolver without going through spawn().
+export function resolveSpawn(bin: string): { command: string; shell: boolean; wantsStdinPrompt: boolean } {
   if (!IS_WIN) return { command: bin, shell: false, wantsStdinPrompt: false }
   const exts = (process.env.PATHEXT ?? '.COM;.EXE;.BAT;.CMD').split(';').map((e) => e.trim()).filter(Boolean)
   for (const dir of (process.env.PATH ?? '').split(PATH_DELIMITER)) {
     if (!dir) continue
-    for (const ext of ['', ...exts]) {
+    for (const ext of exts) {
       const candidate = join(dir, bin + ext)
       if (existsSync(candidate)) {
         const isBatch = /\.(cmd|bat)$/i.test(candidate)
-        return { command: candidate, shell: isBatch, wantsStdinPrompt: isBatch }
+        return { command: candidate, shell: true, wantsStdinPrompt: isBatch }
       }
     }
   }
-  // Not found on PATH — let the shell resolve it, and feed the prompt via stdin.
+  // Last resort: only an extensionless shim (nvm-windows) is on PATH. The shim
+  // itself is a `#!/bin/sh` wrapper and cannot be exec'd without a shell → force
+  // shell:true so Node routes the call through cmd.exe, which can find the
+  // .cmd via PATHEXT after the shim.
+  for (const dir of (process.env.PATH ?? '').split(PATH_DELIMITER)) {
+    if (!dir) continue
+    const shim = join(dir, bin)
+    if (existsSync(shim)) return { command: shim, shell: true, wantsStdinPrompt: true }
+  }
+  // Not found on PATH at all — let the shell resolve it, and feed the prompt via stdin.
   return { command: bin, shell: true, wantsStdinPrompt: true }
 }
 
@@ -78,6 +96,7 @@ export interface EnginePersona {
   id: string
   name: string
   role: string | null
+  systemPrompt: string | null
 }
 
 export interface EngineRunArgs {
@@ -510,6 +529,13 @@ function spawnCapture(
   })
 }
 
+/** The small/fast model the triage path actually runs on. `probe` must use the
+ *  SAME one or `doctor` reports a red small-brain for an operator whose custom
+ *  provider has no `haiku` — even though their triage is configured correctly. */
+function triageModel(fallback: string): string {
+  return process.env.CUMORA_TRIAGE_MODEL?.trim() || fallback
+}
+
 function extraArgs(envVar: string): string[] {
   const raw = process.env[envVar]
   return raw ? raw.split(/\s+/).filter(Boolean) : []
@@ -523,6 +549,7 @@ const CLAUDE_HOME_LAYOUT: HomeLayout = { personaFile: 'CLAUDE.md', skillsDir: '.
 const PERSONA_HEADER = (p: EnginePersona, layout: HomeLayout = CLAUDE_HOME_LAYOUT): string =>
   `# ${p.name}${p.role ? ` — ${p.role}` : ''}\n\n` +
   `You are **${p.name}**, a member of a team that collaborates in Cumora (a team chat).\n` +
+  (p.systemPrompt?.trim() ? `\n## Your style\n${p.systemPrompt.trim()}\n\n` : '\n') +
   `This directory is your private home and your working directory — it persists\n` +
   `across wakes and is yours alone. Its layout:\n` +
   `- \`${layout.personaFile}\` (this file) — always loaded each wake; keep it short.\n` +
@@ -826,7 +853,7 @@ class ClaudeAdapter implements EngineAdapter {
     // → haiku (the cerebellum); 'big' → omit --model so Claude uses its DEFAULT
     // (the main reasoning brain). One token in, "OK" out — proves the binary runs
     // and that tier is authed/has quota, with NO tools/MCP/persona.
-    const model = args.tier === 'small' ? ['--model', 'haiku'] : []
+    const model = args.tier === 'small' ? ['--model', triageModel('haiku')] : []
     const { command, shell, wantsStdinPrompt } = resolveSpawn(this.bin)
     const base = ['-p', ...model, '--output-format', 'text', '--dangerously-skip-permissions', '--strict-mcp-config']
     const argv = wantsStdinPrompt ? base : ['-p', DOCTOR_PROMPT, ...base.slice(1)]
@@ -878,8 +905,11 @@ class ClaudeAdapter implements EngineAdapter {
   async seedHome(home: string, persona: EnginePersona): Promise<void> {
     await ensureCommonHome(home)
     await mkdir(join(home, '.claude', 'skills'), { recursive: true })
-    const claudeMd = join(home, 'CLAUDE.md')
-    if (!(await exists(claudeMd))) await writeFile(claudeMd, PERSONA_HEADER(persona), 'utf8')
+    // Always (re)written from the DB's name/role/systemPrompt — this file is
+    // system-owned, not agent-editable, so it's safe to overwrite on every
+    // start()/restart (including the restart configMatches() triggers when
+    // the operator edits the agent's persona in Cumora).
+    await writeFile(join(home, 'CLAUDE.md'), PERSONA_HEADER(persona), 'utf8')
     // settings.json lets bash (hence the cumora shim) run without prompts in
     // this isolated home. Only written if absent so the user can customize.
     const settings = join(home, '.claude', 'settings.json')
@@ -994,6 +1024,9 @@ class CodexSession implements EngineSession {
   // thread params WITHOUT threadId — reused to start a FRESH thread if a resume fails.
   private readonly baseThreadParams: Record<string, unknown>
   private ready = false
+  // Why the handshake died, when it did — so a send() landing after the teardown
+  // reports the real cause instead of a generic "process gone".
+  private handshakeError: string | null = null
   private pending: { resolve: (r: EngineRunResult) => void } | null = null
   private queuedPrompt: string | null = null
   private activeTurnId: string | null = null
@@ -1034,7 +1067,7 @@ class CodexSession implements EngineSession {
 
   send(prompt: string): Promise<EngineRunResult> {
     if (this.pending) return Promise.resolve({ exitCode: 1, error: 'engine session busy — a turn is already in flight', sessionId: this.threadId })
-    if (!this.alive) return Promise.resolve({ exitCode: this.exitCode || 1, error: 'engine session is not alive (process gone)', sessionId: this.threadId })
+    if (!this.alive) return Promise.resolve({ exitCode: this.exitCode || 1, error: this.handshakeError ?? 'engine session is not alive (process gone)', sessionId: this.threadId })
     return new Promise<EngineRunResult>((resolve) => {
       this.pending = { resolve }
       this.turnStart = { ...this.cum }
@@ -1216,6 +1249,18 @@ class CodexSession implements EngineSession {
   private failPending(error: string): void {
     if (this.pending) this.settle(error)
     else this.onLog(`[codex] ${error}`)
+    // A failure BEFORE the thread ever opened kills the SESSION, not just this
+    // turn. The handshake is one-shot — threadReq is consumed at the initialize
+    // ack, and only a failed thread/resume re-issues a thread/start — so `ready`
+    // can never flip afterwards, and every later send() would park its prompt in
+    // queuedPrompt with nothing left able to drain it (the daemon awaits that
+    // promise forever, so the agent goes silently and permanently dead and its
+    // big-brain slot never comes back). The app-server SURVIVES rejecting the
+    // handshake (a malformed ~/.codex/config.toml, a model this account can't
+    // use, protocol drift), so `alive` would keep advertising a usable session
+    // and the daemon would reuse the zombie on every wake. Tear it down instead:
+    // a !alive session is dropped and the next wake spawns a clean one.
+    if (!this.ready) { this.handshakeError = error; this.stop() }
   }
   private die(code: number, why: string): void {
     const alreadyDown = this.exited
@@ -1257,7 +1302,7 @@ class CodexAdapter implements EngineAdapter {
     // 'small' → gpt-5.4-mini (the cerebellum); 'big' → omit --model so Codex uses
     // its default model. `exec` non-interactive, no bypass/sandbox flags needed
     // for a tool-free one-token reply.
-    const model = args.tier === 'small' ? ['--model', 'gpt-5.4-mini'] : []
+    const model = args.tier === 'small' ? ['--model', triageModel('gpt-5.4-mini')] : []
     const { command, shell } = resolveSpawn(this.bin)
     const argv = ['exec', ...model, '--skip-git-repo-check', DOCTOR_PROMPT]
     return spawnCapture(command, argv, {
@@ -1363,8 +1408,8 @@ class CodexAdapter implements EngineAdapter {
 
   async seedHome(home: string, persona: EnginePersona): Promise<void> {
     await ensureCommonHome(home)
-    const agentsMd = join(home, 'AGENTS.md')
-    if (!(await exists(agentsMd))) await writeFile(agentsMd, PERSONA_HEADER(persona), 'utf8')
+    // See ClaudeAdapter.seedHome: system-owned, safe to overwrite every start.
+    await writeFile(join(home, 'AGENTS.md'), PERSONA_HEADER(persona), 'utf8')
   }
 
   run(args: EngineRunArgs): Promise<EngineRunResult> {
