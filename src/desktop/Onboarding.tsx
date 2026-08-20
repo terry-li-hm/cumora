@@ -20,7 +20,7 @@ export function Onboarding() {
   // Claude is the default; ANY other pick must be named explicitly. We DON'T
   // append `--engine claude` so a Claude-less machine still auto-detects rather
   // than erroring on a Claude it doesn't have.
-  const [engine, setEngine] = useState<'claude' | 'codex' | 'grok' | 'cursor'>('claude')
+  const [engine, setEngine] = useState<'claude' | 'codex' | 'grok' | 'pi' | 'cursor'>('claude')
   // Default to installing the always-on service: it auto-starts on boot,
   // auto-restarts on crash, and auto-updates — so the user isn't tied to a
   // terminal that must stay open. Appends `--install-service` to the command.
@@ -69,7 +69,8 @@ export function Onboarding() {
             Your agents run on <strong>your own machine</strong> (or a VPS), powered by your local
             <span className="font-mono text-[13px]"> Claude Code</span>,
             <span className="font-mono text-[13px]"> Codex</span>,
-            <span className="font-mono text-[13px]"> Grok Build</span>, or
+            <span className="font-mono text-[13px]"> Grok Build</span>,
+            <span className="font-mono text-[13px]"> pi</span>, or
             <span className="font-mono text-[13px]"> Cursor</span>. Pair a computer to get started —
             your starter team will set up there, each with its own isolated workspace, memory, and skills.
           </p>
@@ -79,7 +80,7 @@ export function Onboarding() {
               <>
                 <div className="text-[13px] text-ink-600 mb-4">
                   On the machine you want to host your agents, you'll run one command. It needs
-                  <span className="font-mono"> claude</span>, <span className="font-mono">codex</span>, <span className="font-mono">grok</span>, or <span className="font-mono">cursor-agent</span> installed.
+                  <span className="font-mono"> claude</span>, <span className="font-mono">codex</span>, <span className="font-mono">grok</span>, <span className="font-mono">pi</span>, or <span className="font-mono">cursor-agent</span> installed.
                 </div>
                 {err && <div className="text-[12px] text-coral-deep bg-coral-soft rounded-[8px] p-2 mb-3">{err}</div>}
                 <button onClick={getCode} disabled={busy}
@@ -96,7 +97,7 @@ export function Onboarding() {
                 <div className="flex items-center gap-2.5 mb-2.5">
                   <span className="text-[12px] text-ink-500">Engine</span>
                   <div className="inline-flex rounded-[9px] p-0.5" style={{ background: 'var(--ink-100)' }}>
-                    {([['claude', 'Claude Code'], ['codex', 'Codex'], ['grok', 'Grok Build'], ['cursor', 'Cursor']] as const).map(([id, label]) => (
+                    {([['claude', 'Claude Code'], ['codex', 'Codex'], ['grok', 'Grok Build'], ['pi', 'pi'], ['cursor', 'Cursor']] as const).map(([id, label]) => (
                       <button key={id} type="button" onClick={() => setEngine(id)}
                         className="px-3 py-1 rounded-[7px] text-[12px] font-semibold transition-colors duration-150"
                         style={engine === id

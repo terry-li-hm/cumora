@@ -3,7 +3,7 @@
  *
  * A long-running process on the user's machine (laptop or VPS) that hosts one
  * or more of their Cumora agents, using a local engine (Claude Code / Codex /
- * Grok Build / Cursor Agent) as each agent's brain. See docs/BYOA.md.
+ * Grok Build / pi / Cursor Agent) as each agent's brain. See docs/BYOA.md.
  *
  * It talks to the Cumora server only over HTTP — no DB/Redis — so it can run
  * anywhere:
@@ -18,7 +18,7 @@
  * Standalone: only Node builtins + the DB-free SSE parser + engine.ts.
  */
 import { createHash } from 'node:crypto'
-import { mkdir, writeFile, readFile, chmod, rm, stat, copyFile, truncate } from 'node:fs/promises'
+import { mkdir, writeFile, readFile, chmod, rm, stat, copyFile, truncate, appendFile } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
 import { homedir, hostname } from 'node:os'
 import { join, dirname } from 'node:path'
@@ -27,7 +27,7 @@ import { promisify } from 'node:util'
 
 const execFileP = promisify(execFile)
 import { parseSseStream, wakeStreamWasStable } from '../runtime/sse-parse.js'
-import { detectEngines, getAdapter, ENGINE_IDS, runEngineDoctor, type EngineId, type EngineSession, type EngineRunResult, type EngineUsage, type EngineHopReport } from './engine.js'
+import { detectEngines, getAdapter, grantsChromatinAccess, ENGINE_IDS, runEngineDoctor, type EngineId, type EngineSession, type EngineRunResult, type EngineUsage, type EngineHopReport } from './engine.js'
 import { usageFromClaude, type TokenUsage } from '../cost.js'
 import { parseTriage, finalizeTriage, isRateLimited } from '../triage-core.js'
 import { GLANCE_YIELD_RULES } from '../glance-protocol.js'
@@ -41,6 +41,10 @@ const AGENTS_ROOT = join(CONFIG_DIR, 'agents')
 // `--resume` the SAME engine session — recovering the in-turn context an
 // interrupted long task was building, instead of starting cold.
 const SESSIONS_DIR = join(CONFIG_DIR, 'sessions')
+function protectedReadReceiptsPath(): string {
+  return process.env.CUMORA_PROTECTED_READ_RECEIPTS
+    || join(homedir(), '.local', 'share', 'vivesca', 'cumora-route-receipts.jsonl')
+}
 // Bounded grace on a forced shutdown (SIGTERM/SIGINT): let an in-flight turn try
 // to finish before we kill the engine child. The OS supervisor SIGKILLs not long
 // after SIGTERM, so this is best-effort for SHORT turns; long tasks rely on the
@@ -583,6 +587,9 @@ function authFailureHint(engine: EngineId, detail: string): string {
   if (engine === 'cursor') {
     return 'Open a terminal on that computer and run `cursor-agent login` (or fix its quota / API key), then wake the agent again.'
   }
+  if (engine === 'pi') {
+    return 'Open pi on that computer and re-run `/login` for its provider (or fix its quota / API key), then wake the agent again.'
+  }
   return 'Open Codex on that computer and refresh its login or quota, then wake the agent again.'
 }
 
@@ -594,6 +601,7 @@ function missingEngineMessage(): string {
     '  - Claude Code: install the `claude` CLI, then run `claude` once to sign in',
     '  - Codex: install the `codex` CLI, then run `codex` once to sign in',
     '  - Grok Build: install the `grok` CLI, then run `grok login` once',
+    '  - pi: install `@earendil-works/pi-coding-agent`, then run `pi` once and `/login` a provider',
     '  - Cursor Agent: install Cursor (the `cursor-agent` CLI ships with it), then run `cursor-agent login`',
     '',
     'After that, rerun:',
@@ -601,12 +609,50 @@ function missingEngineMessage(): string {
   ].join('\n')
 }
 
+function approvedAccountSurface(engine: EngineId, model?: string | null): string | null {
+  if (engine === 'claude') return "Terry's approved opted-out Anthropic Max subscription"
+  if (engine === 'codex') return "Terry's approved ChatGPT subscription"
+  if (engine === 'grok') return "Terry's approved opted-out SuperGrok Heavy subscription"
+  if (engine === 'cursor') return "Terry's approved Cursor Ultra subscription with Privacy Mode"
+  if (engine === 'pi' && model?.startsWith('openai-codex/')) return "Terry's approved ChatGPT subscription"
+  return null
+}
+
+/** Fail-closed receipt written before an eligible engine can search Chromatin.
+ * It contains routing metadata only, never room text or vault paths. */
+export async function recordProtectedReadReceipt(args: {
+  agentId: string
+  engine: EngineId
+  model?: string | null
+  purpose: 'cumora-chat-turn' | 'cumora-agenda-turn'
+  conversationId?: string | null
+}): Promise<void> {
+  if (!grantsChromatinAccess(args.engine, args.model)) return
+  const accountSurface = approvedAccountSurface(args.engine, args.model)
+  if (!accountSurface) throw new Error(`protected-read route is not attested: ${args.engine}/${args.model ?? '<default>'}`)
+  const receiptPath = protectedReadReceiptsPath()
+  await mkdir(dirname(receiptPath), { recursive: true })
+  const receipt = {
+    recordedAt: new Date().toISOString(),
+    providerRoute: args.engine,
+    model: args.model ?? '<engine-default>',
+    accountSurface,
+    purpose: args.purpose,
+    scope: 'task-relevant Chromatin read-only; no exact-file preselection',
+    agentId: args.agentId,
+    ...(args.conversationId ? { conversationId: args.conversationId } : {}),
+    exclusions: ['unrelated material', 'credentials', 'secrets', 'live corporate surfaces'],
+  }
+  await appendFile(receiptPath, `${JSON.stringify(receipt)}\n`, { encoding: 'utf8', mode: 0o600 })
+  await chmod(receiptPath, 0o600)
+}
+
 function helpText(): string {
   return [
     'cumora agent computer — run your Cumora agents on THIS machine (BYOA)',
     '',
     'The daemon talks to a Cumora server over HTTP and drives a local agent',
-    'engine (Claude Code, Codex, Grok Build, or Cursor Agent). Pair once, then it runs in the background.',
+    'engine (Claude Code, Codex, Grok Build, pi, or Cursor Agent). Pair once, then it runs in the background.',
     '',
     'Usage:',
     '  npx cumora@latest agent computer --pair <code> [--server <url>] [--engine <id>]',
@@ -1116,7 +1162,7 @@ class AgentRunner {
   }
 
   async start(): Promise<void> {
-    await this.adapter.seedHome(this.home, { id: this.agent.id, name: this.agent.name, role: this.agent.role, systemPrompt: this.agent.systemPrompt })
+    await this.adapter.seedHome(this.home, { id: this.agent.id, name: this.agent.name, role: this.agent.role, systemPrompt: this.agent.systemPrompt, model: this.agent.model })
     await writeShim(this.binDir)
     await this.loadSessionId()
     void this.streamLoop()
@@ -1393,7 +1439,7 @@ class AgentRunner {
       const verdict = finalizeTriage(parsed, 'support-model-local')
       // Record the gate's cache-aware cost (fire-and-forget). A BYOA triage runs
       // LOCAL + cold-session — its input is uncached, the cost this ledger exists
-      // to weigh. usage is present for Claude and Cursor; absent for Codex/Grok.
+      // to weigh. usage is present for Claude, pi, and Cursor; absent for Codex/Grok.
       void this.recordTriageUsage(token, verdict.actionable, verdict.reason, res.usage, res.model)
       return verdict
     }
@@ -1423,6 +1469,7 @@ class AgentRunner {
     if (this.adapter.id === 'claude') return 'haiku'
     if (this.adapter.id === 'grok') return 'grok-4.5'
     if (this.adapter.id === 'codex') return 'gpt-5.4-mini'
+    if (this.adapter.id === 'pi') return this.agent.model ?? '<pi-default>'
     return this.agent.model ?? '<cursor-default>'
   }
 
@@ -1709,6 +1756,12 @@ class AgentRunner {
         runtimeGet<{ roster: string }>(this.cfg.serverUrl, '/roster', token).then((r) => r?.roster ?? '').catch(() => ''),
       ])
       const resumeSessionId = this.sessionId
+      await recordProtectedReadReceipt({
+        agentId: this.agent.id,
+        engine: this.adapter.id,
+        model: this.engineModel(),
+        purpose: 'cumora-agenda-turn',
+      })
       const session = this.ensureEngineSession()
       const prompt = this.turnPrompt(session, this.agendaDelta(ag.brief, memoryDigest, roster))
       const result = session
@@ -2057,6 +2110,13 @@ class AgentRunner {
           ])
           const resumeSessionId = this.sessionId
           let result: EngineRunResult
+          await recordProtectedReadReceipt({
+            agentId: this.agent.id,
+            engine: this.adapter.id,
+            model: this.engineModel(),
+            purpose: 'cumora-chat-turn',
+            conversationId: convo,
+          })
           const session = this.ensureEngineSession()
           // Standing scaffold rides the session's system-prompt file; send only the
           // small per-turn delta when it does (else inline it — see turnPrompt).

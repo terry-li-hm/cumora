@@ -18,7 +18,7 @@ import { join } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { afterEach, test } from 'node:test'
 import assert from 'node:assert/strict'
-import { getAdapter, type EngineHopReport } from '../agents/computer/engine.js'
+import { getAdapter, grantsChromatinAccess, type EngineHopReport } from '../agents/computer/engine.js'
 
 const IS_WIN = process.platform === 'win32'
 const tempDirs: string[] = []
@@ -127,6 +127,17 @@ async function fakeLog(f: Fixture): Promise<Array<{ argv?: string[]; cmd?: { typ
   return (await readFile(f.log, 'utf8')).split('\n').filter(Boolean).map((l) => JSON.parse(l))
 }
 
+test('Chromatin access follows exact approved subscription routes', () => {
+  assert.equal(grantsChromatinAccess('claude'), true)
+  assert.equal(grantsChromatinAccess('codex'), true)
+  assert.equal(grantsChromatinAccess('grok'), true)
+  assert.equal(grantsChromatinAccess('cursor'), true)
+  assert.equal(grantsChromatinAccess('pi', 'openai-codex/gpt-5.6-sol:high'), true)
+  assert.equal(grantsChromatinAccess('pi', 'xai/grok-4.6'), false)
+  assert.equal(grantsChromatinAccess('pi', 'bigmodel-coding/glm-5.3'), false)
+  assert.equal(grantsChromatinAccess('pi', null), false)
+})
+
 test('pi seedHome lays out AGENTS.md + .pi/skills and rewrites system-owned persona (chromatin eligibility)', { skip: IS_WIN }, async () => {
   const f = await fixture()
   const pi = getAdapter('pi')
@@ -145,7 +156,7 @@ test('pi seedHome lays out AGENTS.md + .pi/skills and rewrites system-owned pers
     model: 'openai-codex/gpt-5.6-sol:high',
   })
   const rewritten = await readFile(join(f.home, 'AGENTS.md'), 'utf8')
-  assert.match(rewritten, /`chromatin\/` — the operator's note vault/)
+  assert.match(rewritten, /`chromatin\/` — the operator's read-only note vault/)
   assert.ok(existsSync(join(f.home, 'chromatin')), 'openai-codex pi pin gets the Chromatin symlink')
 })
 
