@@ -2140,13 +2140,12 @@ class PiAdapter implements EngineAdapter {
 //   - A stream may report `is_error:true` with process exit 0 — that is a
 //     FAILED turn (model unavailable, …), so the stream decides, not the exit
 //     code (same discipline pi's json mode forced).
-//   - usage.inputTokens INCLUDES the cache-read portion — subtracting it keeps
-//     the Claude-shaped EngineUsage the ledger prices from double counting.
+//   - usage reports uncached input and cache reads as separate fields, matching
+//     Cursor's bundled `TokenUsage` schema; map them directly without folding.
 // Triage/probe use the READ-ONLY `--mode ask` variant and never `--force`.
 
-/** Cursor's result-event usage (OpenAI-ish camelCase). `inputTokens` includes
- *  the cache-read portion, so it must be split before it can ride the
- *  Anthropic-shaped EngineUsage the daemon's ledger already prices. */
+/** Cursor's result-event usage (OpenAI-ish camelCase). Its bundled TokenUsage
+ *  schema carries uncached input and cache reads as separate counters. */
 interface CursorUsage { inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; cacheWriteTokens?: number }
 
 /** The subset of Cursor's stream-json we act on. Everything else is logged and
@@ -2162,18 +2161,15 @@ interface CursorEvent {
   message?: { role?: unknown; content?: unknown }
 }
 
-/** Normalize Cursor's usage into the Claude-shaped EngineUsage WITHOUT double
- *  counting: input_tokens excludes the cached read portion (Cursor folds it
- *  into inputTokens; Anthropic-shaped fields treat them as disjoint),
+/** Normalize Cursor's disjoint usage counters into EngineUsage;
  *  cacheWrite maps to cache_creation. */
 function cursorUsageToEngineUsage(u: CursorUsage | undefined): EngineUsage | undefined {
   if (!u || typeof u !== 'object') return undefined
   const num = (v: unknown): number => (typeof v === 'number' && Number.isFinite(v) ? v : 0)
-  const cacheRead = num(u.cacheReadTokens)
   return {
-    input_tokens: Math.max(0, num(u.inputTokens) - cacheRead),
+    input_tokens: num(u.inputTokens),
     output_tokens: num(u.outputTokens),
-    cache_read_input_tokens: cacheRead,
+    cache_read_input_tokens: num(u.cacheReadTokens),
     cache_creation_input_tokens: num(u.cacheWriteTokens),
   }
 }

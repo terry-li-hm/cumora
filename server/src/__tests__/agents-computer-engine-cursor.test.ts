@@ -114,7 +114,7 @@ test('cursor run parses a fresh stream, normalizes usage, and reports one hop', 
   assert.equal(result.sessionId, 'cursor-session-new')
   assert.equal(result.model, 'cursor-test-model')
   assert.deepEqual(result.usage, {
-    input_tokens: 60,
+    input_tokens: 100,
     output_tokens: 12,
     cache_read_input_tokens: 40,
     cache_creation_input_tokens: 3,
@@ -164,7 +164,7 @@ test('cursor classify is read-only, parses result text and usage, and honors the
   assert.equal(result.text, 'echo:classify this')
   assert.equal(result.model, 'cursor-small')
   assert.deepEqual(result.usage, {
-    input_tokens: 60,
+    input_tokens: 100,
     output_tokens: 12,
     cache_read_input_tokens: 40,
     cache_creation_input_tokens: 3,

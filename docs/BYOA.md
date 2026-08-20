@@ -224,8 +224,8 @@ columns, else the deploy-level `CUMORA_DEFAULT_CLAUDE_MODEL` /
 model is a pi pattern, ideally `provider/id`; a `:<level>` suffix opts that
 agent into extended thinking, which the daemon otherwise turns off). A Cursor
 stream may report `is_error:true` with process exit 0 — the daemon treats that
-as a failed turn, and normalizes the result event's usage (`inputTokens`
-includes the cache-read portion, so it is split to avoid double counting).
+as a failed turn, and maps the result event's disjoint input, output,
+cache-read and cache-write counters into the common ledger shape.
 Cursor is not a cleared Chromatin lane: its agents never get the vault symlink.
 
 ### Running against a custom provider
