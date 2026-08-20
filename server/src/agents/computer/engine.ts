@@ -2799,6 +2799,25 @@ function spawnCursorStream(
   })
 }
 
+/** Cursor scans Claude-compatible global skills even when its cwd is an isolated
+ * agent home. A nested macOS sandbox keeps unrelated harness and credential
+ * trees out while preserving Cursor's own login plus the approved Chromatin
+ * symlink. The parent daemon sandbox separately enforces vault read-only. */
+function constrainCursorSpawn(command: string, args: string[], shell: boolean): { command: string; args: string[]; shell: boolean } {
+  if (process.platform !== 'darwin') return { command, args, shell }
+  const home = homedir()
+  const profile = [
+    '(version 1)',
+    '(allow default)',
+    `(deny file-read* (subpath "${join(home, '.claude')}"))`,
+    `(deny file-read* (subpath "${join(home, '.codex')}"))`,
+    `(deny file-read* (subpath "${join(home, '.grok')}"))`,
+    `(deny file-read* (subpath "${join(home, '.ssh')}"))`,
+    `(deny file-write* (subpath "${join(home, 'chromatin')}"))`,
+  ].join('\n')
+  return { command: '/usr/bin/sandbox-exec', args: ['-p', profile, command, ...args], shell: false }
+}
+
 class CursorAdapter implements EngineAdapter {
   readonly id = 'cursor' as const
   readonly bin = 'cursor-agent'
@@ -2824,8 +2843,10 @@ class CursorAdapter implements EngineAdapter {
     // warm instead).
     const resume = args.resumeSessionId ? ['--resume', args.resumeSessionId] : []
     const base = ['-p', ...resume, ...model, '--output-format', 'stream-json', '--force', '--trust']
-    return spawnCursorStream(command, wantsStdinPrompt ? base : [...base, prompt], {
-      cwd: args.cwd, env: args.env, signal: args.signal, onLog: args.onLog, shell,
+    const spawnArgs = wantsStdinPrompt ? base : [...base, prompt]
+    const constrained = constrainCursorSpawn(command, spawnArgs, shell)
+    return spawnCursorStream(constrained.command, constrained.args, {
+      cwd: args.cwd, env: args.env, signal: args.signal, onLog: args.onLog, shell: constrained.shell,
       stdinText: wantsStdinPrompt ? prompt : undefined,
       onHopUsage: args.onHopUsage,
       pin: args.model ?? null,
@@ -2846,8 +2867,10 @@ class CursorAdapter implements EngineAdapter {
     const { command, shell, wantsStdinPrompt } = resolveSpawn(this.bin)
     const model = args.model ? ['--model', args.model] : []
     const base = ['--mode', 'ask', '-p', '--output-format', 'stream-json', ...model, '--trust']
-    return spawnCursorStream(command, wantsStdinPrompt ? base : [...base, prompt], {
-      cwd: args.cwd, env: args.env, signal: args.signal, onLog: args.onLog, shell,
+    const spawnArgs = wantsStdinPrompt ? base : [...base, prompt]
+    const constrained = constrainCursorSpawn(command, spawnArgs, shell)
+    return spawnCursorStream(constrained.command, constrained.args, {
+      cwd: args.cwd, env: args.env, signal: args.signal, onLog: args.onLog, shell: constrained.shell,
       stdinText: wantsStdinPrompt ? prompt : undefined,
       pin: args.model ?? null,
     })
@@ -2912,7 +2935,9 @@ class CursorAdapter implements EngineAdapter {
       const resume = args.resumeSessionId ? ['--resume', args.resumeSessionId] : []
       const { command, shell, wantsStdinPrompt } = resolveSpawn(this.bin)
       const base = [...flags, ...resume, '-p']
-      return spawnEngine(command, wantsStdinPrompt ? base : [...base, args.prompt], args, { shell, stdinText: wantsStdinPrompt ? args.prompt : undefined })
+      const spawnArgs = wantsStdinPrompt ? base : [...base, args.prompt]
+      const constrained = constrainCursorSpawn(command, spawnArgs, shell)
+      return spawnEngine(constrained.command, constrained.args, args, { shell: constrained.shell, stdinText: wantsStdinPrompt ? args.prompt : undefined })
     }
     return this.turn(args.prompt, {
       cwd: args.home, env: args.env, signal: args.signal, onLog: args.onLog,
