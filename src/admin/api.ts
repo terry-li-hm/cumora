@@ -120,7 +120,7 @@ export type LlmCallPurpose =
   | 'palette' | 'gender' | 'avatar-image' | 'agent-image'
 
 export type LlmCallStatus = 'ok' | 'rate_limited' | 'timeout' | 'failed'
-export type LlmCallSource = 'cloud' | 'byoa-claude' | 'byoa-codex' | 'byoa-pi'
+export type LlmCallSource = 'cloud' | 'byoa-claude' | 'byoa-codex' | 'byoa-pi' | 'byoa-cursor'
 
 export interface LlmSummary {
   sinceDays: number

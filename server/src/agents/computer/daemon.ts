@@ -3,7 +3,7 @@
  *
  * A long-running process on the user's machine (laptop or VPS) that hosts one
  * or more of their Cumora agents, using a local engine (Claude Code / Codex /
- * pi) as each agent's brain. See docs/BYOA.md.
+ * pi / Cursor Agent) as each agent's brain. See docs/BYOA.md.
  *
  * It talks to the Cumora server only over HTTP — no DB/Redis — so it can run
  * anywhere:
@@ -559,6 +559,9 @@ function authFailureHint(engine: EngineId, detail: string): string {
   if (engine === 'pi') {
     return 'Open pi on that computer and re-run `/login` for its provider (or fix the API key / quota), then wake the agent again.'
   }
+  if (engine === 'cursor') {
+    return 'Open a terminal on that computer and run `cursor-agent login` (or fix its quota / API key), then wake the agent again.'
+  }
   return 'Open Codex on that computer and refresh its login or quota, then wake the agent again.'
 }
 
@@ -570,6 +573,7 @@ function missingEngineMessage(): string {
     '  - Claude Code: install the `claude` CLI, then run `claude` once to sign in',
     '  - Codex: install the `codex` CLI, then run `codex` once to sign in',
     '  - pi: `npm install -g --ignore-scripts @earendil-works/pi-coding-agent`, then run `pi` once and `/login` a provider',
+    '  - Cursor Agent: install Cursor (the `cursor-agent` CLI ships with it), then run `cursor-agent login`',
     '',
     'After that, rerun:',
     '  npx cumora@latest agent computer --pair <code>',
@@ -581,7 +585,7 @@ function helpText(): string {
     'cumora agent computer — run your Cumora agents on THIS machine (BYOA)',
     '',
     'The daemon talks to a Cumora server over HTTP and drives a local agent',
-    'engine (Claude Code, Codex or pi). Pair once, then it runs in the background.',
+    'engine (Claude Code, Codex, pi or Cursor Agent). Pair once, then it runs in the background.',
     '',
     'Usage:',
     '  npx cumora@latest agent computer --pair <code> [--server <url>] [--engine <id>]',
@@ -1172,8 +1176,9 @@ class AgentRunner {
 
   /** The long-lived engine process for this agent (persistent stream-json),
    *  created lazily and reused across wakes so turns 2..N skip the cold start.
-   *  Returns null if the engine has no persistent mode (codex / a custom
-   *  CLAUDE_ARGS override) — the caller then falls back to one-shot run(). If the
+   *  Returns null if the engine has no persistent mode (codex exec, cursor —
+   *  no stdio protocol in this version — or a custom CLAUDE_ARGS override) —
+   *  the caller then falls back to one-shot run(). If the
    *  prior process has died it respawns, resuming this.sessionId so context
    *  carries across the restart. */
   private ensureEngineSession(): EngineSession | null {
@@ -1301,7 +1306,7 @@ class AgentRunner {
         prompt: `${payload.instructions}\n\n${payload.input}`,
         env: this.engineEnv(),
         // Engine picks its own cheap default (claude→haiku, codex→gpt-5.4-mini,
-        // pi→its configured default model); CUMORA_TRIAGE_MODEL overrides for any.
+        // pi/cursor→their configured default model); CUMORA_TRIAGE_MODEL overrides for any.
         model: process.env.CUMORA_TRIAGE_MODEL,
         signal: controller.signal,
       })
@@ -1362,7 +1367,7 @@ class AgentRunner {
       const verdict = finalizeTriage(parsed, 'support-model-local')
       // Record the gate's cache-aware cost (fire-and-forget). A BYOA triage runs
       // LOCAL + cold-session — its input is uncached, the cost this ledger exists
-      // to weigh. usage is present for claude / pi (json output), absent for codex.
+      // to weigh. usage is present for claude / pi / cursor (json output), absent for codex.
       void this.recordTriageUsage(token, verdict.actionable, verdict.reason, res.usage, res.model)
       return verdict
     }
@@ -1385,21 +1390,22 @@ class AgentRunner {
   }
 
   /** Triage model id for pricing (the local cerebellum: claude→haiku,
-   *  codex→gpt-5.4-mini), honoring a CUMORA_TRIAGE_MODEL override. pi has no
-   *  fixed cerebellum id — its default model is whatever the user configured — so
-   *  without an override we fall back to the agent's own model as the best guess;
-   *  the engine's REPORTED model (see recordTriageUsage) wins when it has one. */
+   *  codex→gpt-5.4-mini), honoring a CUMORA_TRIAGE_MODEL override. pi and
+   *  cursor have no fixed cerebellum id — their default model is whatever the
+   *  user configured / the account's 'Auto' — so without an override we fall
+   *  back to the agent's own model as the best guess; the engine's REPORTED
+   *  model (see recordTriageUsage) wins when it has one. */
   private triageModel(): string {
     if (process.env.CUMORA_TRIAGE_MODEL) return process.env.CUMORA_TRIAGE_MODEL
     if (this.adapter.id === 'claude') return 'haiku'
     if (this.adapter.id === 'codex') return 'gpt-5.4-mini'
-    return this.agent.model ?? '<pi-default>'
+    return this.agent.model ?? `<${this.adapter.id}-default>`
   }
 
   /** Post one local-triage record to the cost ledger. Best-effort. `usage` is the
-   *  engine's raw breakdown (claude / pi); undefined → recorded as unmeasured
-   *  (codex). `model` is the id the engine REPORTED running on (pi's json stream
-   *  names it); absent → the adapter's nominal triage model. */
+   *  engine's raw breakdown (claude / pi / cursor); undefined → recorded as unmeasured
+   *  (codex). `model` is the id the engine REPORTED running on (pi's / cursor's json
+   *  stream names it); absent → the adapter's nominal triage model. */
   private async recordTriageUsage(token: string, actionable: boolean, reason: string, usage?: EngineUsage, model?: string | null): Promise<void> {
     await runtimeBest(this.cfg.serverUrl, '/triage', token, {
       source: `byoa-${this.adapter.id}`,
@@ -2053,7 +2059,8 @@ class AgentRunner {
             // (with --resume this.sessionId to carry context across the restart).
             if (!session.alive) this.engineSession = null
           } else {
-            // One-shot path: codex, or a user CLAUDE_ARGS override — spawn per turn.
+            // One-shot path: codex, cursor (no persistent protocol), or a user
+            // CLAUDE_ARGS override — spawn per turn (cursor resumes its session id).
             result = await this.adapter.run({
               home: this.home,
               prompt,

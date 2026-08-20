@@ -1,4 +1,4 @@
-# BYOA — Bring Your Own Agent (local Claude Code / Codex / pi as the engine)
+# BYOA — Bring Your Own Agent (local Claude Code / Codex / pi / Cursor as the engine)
 
 Every Cumora agent has a "brain" and a host. The managed path is
 server-side: `runAgentTurn` in `server/src/agents/turn.ts` runs a
@@ -7,7 +7,7 @@ a per-agent Kubernetes pod (the `agent-computer` image).
 
 **BYOA** lets a user supply the brain instead: a long-running daemon on
 the user's own machine (laptop **or** VPS) drives a local **Claude Code**,
-**Codex CLI** or **pi** as the reasoning engine, on the user's own
+**Codex CLI**, **pi** or **Cursor Agent** as the reasoning engine, on the user's own
 subscription — the server never holds the user's provider credentials.
 One daemon hosts **many independent agents** — each with its own isolated
 home directory, memory, skills, and notes. In Cumora these still appear
@@ -38,7 +38,7 @@ managed cloud agents and local agents into the same picture.
   user to set up; it's always online.
 - **Your computers** — machines you pair (your Mac, a VPS). Each runs the
   `cumora agent computer` daemon with a local engine (Claude Code /
-  Codex / pi). Agents you place here are BYOA agents.
+  Codex / pi / Cursor Agent). Agents you place here are BYOA agents.
 
 ```
 Computers
@@ -113,6 +113,8 @@ with rate-limit adaptation, and same-turn steering.
               │   claude --input/output-format stream-json …            │
               │   codex app-server --listen stdio:// (JSON-RPC)         │
               │   pi --mode rpc (JSON commands + events over stdio)     │
+              │   cursor-agent -p --output-format stream-json           │
+              │     (one-shot per wake; --resume keeps the session)     │
               │   bash → cumora shim → POST /runtime/cli (per-agent JWT)│
               └─────────────────────────────────────────────────────────┘
 ```
@@ -178,12 +180,15 @@ from their own agenda — Kanban cards and due calendar slots — via
 ## Engine integration
 
 `server/src/agents/computer/engine.ts` defines one `EngineAdapter` per
-engine (`claude`, `codex`, `pi`). The **primary** path is a persistent
-per-agent session; one-shot `run()` is the fallback.
+engine (`claude`, `codex`, `pi`, `cursor`). The **primary** path is a persistent
+per-agent session; one-shot `run()` is the fallback. Cursor is the exception:
+this `cursor-agent` version exposes no persistent stdio protocol, so its wake
+path IS the one-shot `run()` — each wake spawns a fresh process and `--resume
+<session_id>` re-opens the same session, so context still carries across wakes.
 
 ```ts
 interface EngineAdapter {
-  id: 'claude' | 'codex' | 'pi'
+  id: 'claude' | 'codex' | 'pi' | 'cursor'
   seedHome(home, persona)          // lay out CLAUDE.md/AGENTS.md, skills, dirs
   startSession?(args): EngineSession | null   // persistent session (primary)
   run(args): Promise<…>            // one-shot fallback
@@ -198,25 +203,30 @@ interface EngineSession {
 }
 ```
 
-| Concern | Claude Code | Codex CLI | pi |
-| --- | --- | --- | --- |
-| Persistent session | `claude -p --input-format stream-json --output-format stream-json --verbose [--resume <id>] [--model X]`; turns are stream-json messages on stdin | `codex app-server --listen stdio://`, driven over JSON-RPC (`thread/start` / `thread/resume`); requires a git repo in the home (the daemon inits a throwaway one) | `pi --mode rpc --session-id <id> [--model X] --skill <home>/.pi/skills`; a turn is a `prompt` command on stdin, done at `agent_settled`; steering is pi's native `steer` command |
-| Standing prompt | `--append-system-prompt-file <home>/.cumora-standing-prompt.md` | `developerInstructions` on `thread/start` | `--append-system-prompt <home>/.cumora-standing-prompt.md` |
-| One-shot fallback | `claude -p … --output-format stream-json` | `codex exec … --skip-git-repo-check` | `pi <CUMORA_PI_ARGS> --session-id <id> -p` (print mode) |
-| Fallback triggers | `CUMORA_CLAUDE_ARGS` set | `CUMORA_CODEX_ARGS` set, `CUMORA_CODEX_NO_APP_SERVER=1`, Windows, or git-init failure | `CUMORA_PI_ARGS` set |
-| Memory / persona file | `CLAUDE.md` | `AGENTS.md` | `AGENTS.md` (skills in `.pi/skills/`, loaded via `--skill`) |
-| Triage (small brain) | `claude -p --model haiku --output-format json` | `codex exec --model gpt-5.4-mini` | `pi --mode json --no-session --no-tools --no-extensions --no-skills --no-context-files [--model $CUMORA_TRIAGE_MODEL]` (pi is multi-provider — no fixed cheap model; unset → pi's default) |
+| Concern | Claude Code | Codex CLI | pi | Cursor Agent |
+| --- | --- | --- | --- | --- |
+| Persistent session | `claude -p --input-format stream-json --output-format stream-json --verbose [--resume <id>] [--model X]`; turns are stream-json messages on stdin | `codex app-server --listen stdio://`, driven over JSON-RPC (`thread/start` / `thread/resume`); requires a git repo in the home (the daemon inits a throwaway one) | `pi --mode rpc --session-id <id> [--model X] --skill <home>/.pi/skills`; a turn is a `prompt` command on stdin, done at `agent_settled`; steering is pi's native `steer` command | none in this version (2026.08.11) — no stdio protocol; every wake is a one-shot process |
+| Standing prompt | `--append-system-prompt-file <home>/.cumora-standing-prompt.md` | `developerInstructions` on `thread/start` | `--append-system-prompt <home>/.cumora-standing-prompt.md` | no out-of-band channel — the daemon inlines the standing prompt into each turn's prompt |
+| One-shot fallback | `claude -p … --output-format stream-json` | `codex exec … --skip-git-repo-check` | `pi <CUMORA_PI_ARGS> --session-id <id> -p` (print mode) | `cursor-agent -p --output-format stream-json --force --trust [--model X] [--resume <id>]` — the ONLY path; `--resume <session_id>` keeps continuity across the per-wake processes |
+| Fallback triggers | `CUMORA_CLAUDE_ARGS` set | `CUMORA_CODEX_ARGS` set, `CUMORA_CODEX_NO_APP_SERVER=1`, Windows, or git-init failure | `CUMORA_PI_ARGS` set | always (no persistent mode); `CUMORA_CURSOR_ARGS` replaces the whole turn flag set |
+| Memory / persona file | `CLAUDE.md` | `AGENTS.md` | `AGENTS.md` (skills in `.pi/skills/`, loaded via `--skill`) | `AGENTS.md` (skills in `.cursor/skills/`) |
+| Triage (small brain) | `claude -p --model haiku --output-format json` | `codex exec --model gpt-5.4-mini` | `pi --mode json --no-session --no-tools --no-extensions --no-skills --no-context-files [--model $CUMORA_TRIAGE_MODEL]` (pi is multi-provider — no fixed cheap model; unset → pi's default) | `cursor-agent --mode ask -p --output-format stream-json --trust [--model $CUMORA_TRIAGE_MODEL]` (read-only ask mode, never `--force`; unset → Cursor's 'Auto') |
 
 Sessions carry a resume id (`~/.cumora/sessions/<agentId>.session`); a
 failed resume falls back to a fresh thread instead of wedging the agent.
 Engines run headless with their permission prompts disabled, scoped to
 the agent's isolated home. On Windows the daemon resolves the real
-`claude`/`codex`/`pi` `.cmd` shims and routes large prompts via stdin.
+`claude`/`codex`/`pi`/`cursor-agent` `.cmd` shims and routes large prompts via stdin.
 Model selection: the per-agent `participants.model` / `fast_model`
 columns, else the deploy-level `CUMORA_DEFAULT_CLAUDE_MODEL` /
-`CUMORA_DEFAULT_CODEX_MODEL` / `CUMORA_DEFAULT_PI_MODEL` pins (for pi a
+`CUMORA_DEFAULT_CODEX_MODEL` / `CUMORA_DEFAULT_PI_MODEL` /
+`CUMORA_DEFAULT_CURSOR_MODEL` pins (for pi a
 model is a pi pattern, ideally `provider/id`; a `:<level>` suffix opts that
-agent into extended thinking, which the daemon otherwise turns off).
+agent into extended thinking, which the daemon otherwise turns off). A Cursor
+stream may report `is_error:true` with process exit 0 — the daemon treats that
+as a failed turn, and normalizes the result event's usage (`inputTokens`
+includes the cache-read portion, so it is split to avoid double counting).
+Cursor is not a cleared Chromatin lane: its agents never get the vault symlink.
 
 ### Running against a custom provider
 
@@ -258,6 +268,7 @@ CUMORA_ENGINE_MODEL=local CUMORA_TRIAGE_MODEL=local-small cumora agent computer
     .claude/skills/<name>/SKILL.md ← this agent's skills (Claude)
     .claude/settings.json          ← permissions (allow Bash)
     .pi/skills/<name>/SKILL.md     ← this agent's skills (pi)
+    .cursor/skills/<name>/SKILL.md ← this agent's skills (Cursor)
     bin/cumora                     ← the shim (see below); bin/.runtime-token
     memory/MEMORY.md               ← the agent's durable memory index
     notes/                         ← scratch notes
@@ -286,7 +297,7 @@ credentials are keyed to that dir — so the daemon sets `cwd` to the
 agent's home and does **not** relocate config. Per-agent: project memory,
 skills, settings, notes, workspace. Shared across an owner's agents on
 one machine: the engine login and the user's global config (`~/.claude` /
-`~/.codex` / `~/.pi/agent`). Agents are independent in the dimensions that matter; they
+`~/.codex` / `~/.pi/agent` / `~/.cursor`). Agents are independent in the dimensions that matter; they
 share one engine login per host.
 
 ---
@@ -300,7 +311,7 @@ CREATE TABLE computers (
   owner_user_id     TEXT,            -- null for the managed Cumora Cloud row
   name              TEXT NOT NULL,   -- "Cumora Cloud", "MacBook Pro", …
   kind              TEXT NOT NULL,   -- 'cloud' | 'local' | 'vps'
-  available_engines JSONB,           -- ['claude','codex','pi'] (daemon-detected)
+  available_engines JSONB,           -- ['claude','codex','pi','cursor'] (daemon-detected)
   status            TEXT NOT NULL,   -- 'online' | 'offline' | 'busy'
   last_seen_at      TIMESTAMP,
   credential_hash   TEXT,            -- SHA256 of the device token
@@ -313,7 +324,7 @@ CREATE TABLE computers (
 
 -- participants carry their host + engine + models
 --   computer_id  TEXT   (FK → computers.id)
---   engine       TEXT   ('managed' | 'claude' | 'codex' | 'pi')
+--   engine       TEXT   ('managed' | 'claude' | 'codex' | 'pi' | 'cursor')
 --   model        TEXT   (big-brain override)
 --   fast_model   TEXT   (small-brain override)
 ```

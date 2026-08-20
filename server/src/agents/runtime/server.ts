@@ -32,7 +32,7 @@ import { attachWakeStream, } from './wake-bus.js'
 /** Ledger/triage `source` values a BYOA daemon may declare — one per local
  *  engine. Anything else is coerced to 'byoa-claude' so a newer daemon can't
  *  smuggle a free-form string into the rollup. */
-const BYOA_SOURCES: ReadonlySet<string> = new Set(['byoa-claude', 'byoa-codex', 'byoa-pi'])
+const BYOA_SOURCES: ReadonlySet<string> = new Set(['byoa-claude', 'byoa-codex', 'byoa-pi', 'byoa-cursor'])
 
 export type { WakeEvent } from './wake-bus.js'
 
@@ -416,10 +416,11 @@ runtimeRouter.post('/triage', withAgent(async (c, req, res) => {
 
 // Per-HOP trajectory for BYOA agents. The daemon's ClaudeSession /
 // CodexSession / PiSession emits one EngineHopReport per assistant message
-// (Claude, pi) or per turn-completed (Codex) and batches them into one POST per
+// (Claude, pi) or per turn-completed (Codex; the cursor adapter emits one per
+// result event) and batches them into one POST per
 // N hops or every ~250ms (whichever first). This endpoint accepts a batch +
 // inserts one llm_calls row per hop with the appropriate source ('byoa-claude' |
-// 'byoa-codex' | 'byoa-pi'). Fire-and-forget; a DB hiccup must never break the wake.
+// 'byoa-codex' | 'byoa-pi' | 'byoa-cursor'). Fire-and-forget; a DB hiccup must never break the wake.
 runtimeRouter.post('/llm-calls', withAgent(async (c, req, res) => {
   const body = req.body as {
     source?: string

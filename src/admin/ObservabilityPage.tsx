@@ -157,7 +157,8 @@ const REFRESH_INTERVALS: Array<{ label: string; ms: number }> = [
 // filter is here so the operator can isolate either side when investigating
 // a spike: "did cloud cost spike, or just BYOA token usage?"
 
-// One BYOA pill covering ALL local engines (byoa-claude / byoa-codex / byoa-pi). The rollup
+// One BYOA pill covering ALL local engines (byoa-claude / byoa-codex / byoa-pi /
+// byoa-cursor). The rollup
 // table still shows them as separate rows (different engine/model); this is
 // just the filter — the operator rarely wants to isolate a single BYOA engine,
 // and "Cloud vs BYOA" is the split that matters.
