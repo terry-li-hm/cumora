@@ -709,7 +709,8 @@ class ClaudeSession implements EngineSession {
     // .cmd shim runs (Node can't spawn it with shell:false). The prompt already
     // travels via stdin (stream-json), so no arg-quoting concerns here.
     const { command, shell } = resolveSpawn(bin)
-    this.child = spawn(command, args, { cwd: opts.home, env: opts.env, stdio: ['pipe', 'pipe', 'pipe'], shell })
+    const constrained = constrainTurnSpawn('claude', command, args, shell)
+    this.child = spawn(constrained.command, constrained.args, { cwd: opts.home, env: opts.env, stdio: ['pipe', 'pipe', 'pipe'], shell: constrained.shell })
     this.child.stdout?.on('data', (b: Buffer) => this.onStdout(b))
     this.child.stderr?.on('data', (b: Buffer) => this.onStderr(b))
     this.child.on('error', (err) => this.die(1, err.message))
@@ -1030,7 +1031,8 @@ class ClaudeAdapter implements EngineAdapter {
       MAX_THINKING_TOKENS: args.env.MAX_THINKING_TOKENS ?? '0',
     }
     if (args.fastModel) env.ANTHROPIC_SMALL_FAST_MODEL = args.fastModel
-    return spawnEngine(command, argv, { ...args, env }, { shell, stdinText: wantsStdinPrompt ? args.prompt : undefined })
+    const constrained = constrainTurnSpawn('claude', command, argv, shell)
+    return spawnEngine(constrained.command, constrained.args, { ...args, env }, { shell: constrained.shell, stdinText: wantsStdinPrompt ? args.prompt : undefined })
   }
 
   startSession(args: EngineSessionArgs): EngineSession | null {
@@ -1137,7 +1139,8 @@ class CodexSession implements EngineSession {
     this.threadReq = opts.resumeSessionId
       ? { method: 'thread/resume', params: { threadId: opts.resumeSessionId, ...params } }
       : { method: 'thread/start', params }
-    this.child = spawn(bin, spawnArgs, { cwd: home, env, stdio: ['pipe', 'pipe', 'pipe'], shell: false })
+    const constrained = constrainTurnSpawn('codex', bin, spawnArgs, false)
+    this.child = spawn(constrained.command, constrained.args, { cwd: home, env, stdio: ['pipe', 'pipe', 'pipe'], shell: constrained.shell })
     this.child.stdout?.on('data', (b: Buffer) => this.onStdout(b))
     this.child.stderr?.on('data', (b: Buffer) => { for (const raw of b.toString('utf8').split('\n')) { const l = cleanLine(raw); if (l) this.onLog(l) } })
     this.child.on('error', (err) => this.die(1, err.message))
@@ -1511,7 +1514,9 @@ class CodexAdapter implements EngineAdapter {
       : ['--dangerously-bypass-approvals-and-sandbox', '--skip-git-repo-check']
     const model = args.model ? ['--model', args.model] : []
     const { command, shell } = resolveSpawn(this.bin)
-    return spawnEngine(command, ['exec', ...model, ...base, args.prompt], args, { shell })
+    const argv = ['exec', ...model, ...base, args.prompt]
+    const constrained = constrainTurnSpawn('codex', command, argv, shell)
+    return spawnEngine(constrained.command, constrained.args, args, { shell: constrained.shell })
   }
 
   startSession(args: EngineSessionArgs): EngineSession | null {
@@ -1592,7 +1597,8 @@ class GrokSession implements EngineSession {
     this.sessionNewParams = { cwd: home, mcpServers: [], _meta: meta }
     this.sessionWasLoad = !!opts.resumeSessionId
     const grokEnv: NodeJS.ProcessEnv = { ...env, GROK_DISABLE_AUTOUPDATER: env.GROK_DISABLE_AUTOUPDATER ?? '1' }
-    this.child = spawn(bin, spawnArgs, { cwd: home, env: grokEnv, stdio: ['pipe', 'pipe', 'pipe'], shell: false })
+    const constrained = constrainTurnSpawn('grok', bin, spawnArgs, false)
+    this.child = spawn(constrained.command, constrained.args, { cwd: home, env: grokEnv, stdio: ['pipe', 'pipe', 'pipe'], shell: constrained.shell })
     this.child.stdout?.on('data', (b: Buffer) => this.onStdout(b))
     this.child.stderr?.on('data', (b: Buffer) => {
       for (const raw of b.toString('utf8').split('\n')) {
@@ -1943,7 +1949,8 @@ class GrokAdapter implements EngineAdapter {
       : ['-p', ...resume, ...model, '--output-format', 'streaming-messages-json', '--always-approve', '--no-auto-update']
     const argv = wantsStdinPrompt ? base : (flags.length ? [...base, args.prompt] : ['-p', args.prompt, ...base.slice(1)])
     const env: NodeJS.ProcessEnv = { ...args.env, GROK_DISABLE_AUTOUPDATER: args.env.GROK_DISABLE_AUTOUPDATER ?? '1' }
-    return spawnEngine(command, argv, { ...args, env }, { shell, stdinText: wantsStdinPrompt ? args.prompt : undefined })
+    const constrained = constrainTurnSpawn('grok', command, argv, shell)
+    return spawnEngine(constrained.command, constrained.args, { ...args, env }, { shell: constrained.shell, stdinText: wantsStdinPrompt ? args.prompt : undefined })
   }
 
   startSession(args: EngineSessionArgs): EngineSession | null {
@@ -2237,7 +2244,8 @@ class PiSession implements EngineSession {
     // Cross-platform spawn (Windows: `pi.cmd` via the shell). Everything travels
     // over stdin as JSON here, so there are no argv-quoting concerns.
     const { command, shell } = resolveSpawn(bin)
-    this.child = spawn(command, args, { cwd: opts.home, env: opts.env, stdio: ['pipe', 'pipe', 'pipe'], shell })
+    const constrained = constrainTurnSpawn('pi', command, args, shell)
+    this.child = spawn(constrained.command, constrained.args, { cwd: opts.home, env: opts.env, stdio: ['pipe', 'pipe', 'pipe'], shell: constrained.shell })
     this.child.stdout?.on('data', (b: Buffer) => this.onStdout(b))
     this.child.stderr?.on('data', (b: Buffer) => this.onStderr(b))
     this.child.on('error', (err) => this.die(1, err.message))
@@ -2520,7 +2528,9 @@ class PiAdapter implements EngineAdapter {
       const sid = args.resumeSessionId ?? randomUUID()
       const { command, shell, wantsStdinPrompt } = resolveSpawn(this.bin)
       const base = [...flags, '--session-id', sid, '-p']
-      const r = await spawnEngine(command, wantsStdinPrompt ? base : [...base, args.prompt], args, { shell, stdinText: wantsStdinPrompt ? args.prompt : undefined })
+      const argv = wantsStdinPrompt ? base : [...base, args.prompt]
+      const constrained = constrainTurnSpawn('pi', command, argv, shell)
+      const r = await spawnEngine(constrained.command, constrained.args, args, { shell: constrained.shell, stdinText: wantsStdinPrompt ? args.prompt : undefined })
       return { ...r, sessionId: r.sessionId ?? sid }
     }
     // Default: the persistent rpc path is the ONLY protocol we drive, so a one-shot
@@ -2799,19 +2809,26 @@ function spawnCursorStream(
   })
 }
 
-/** Cursor scans Claude-compatible global skills even when its cwd is an isolated
- * agent home. A nested macOS sandbox keeps unrelated harness and credential
- * trees out while preserving Cursor's own login plus the approved Chromatin
- * symlink. The parent daemon sandbox separately enforces vault read-only. */
-function constrainCursorSpawn(command: string, args: string[], shell: boolean): { command: string; args: string[]; shell: boolean } {
+/** Full agent turns run under an engine-specific macOS sandbox. Every route may
+ * read approved Chromatin but none may write it. Each engine keeps its own auth
+ * store and cannot inspect sibling harness stores; this also stops Cursor's
+ * third-party skill discovery from walking ~/.claude outside its agent home. */
+function constrainTurnSpawn(engine: EngineId, command: string, args: string[], shell: boolean): { command: string; args: string[]; shell: boolean } {
   if (process.platform !== 'darwin') return { command, args, shell }
   const home = homedir()
+  const authDir: Partial<Record<EngineId, string>> = {
+    claude: '.claude',
+    codex: '.codex',
+    grok: '.grok',
+    pi: '.pi',
+    cursor: '.cursor',
+  }
+  const deniedReads = ['.claude', '.codex', '.grok', '.pi', '.cursor']
+    .filter((dir) => dir !== authDir[engine])
   const profile = [
     '(version 1)',
     '(allow default)',
-    `(deny file-read* (subpath "${join(home, '.claude')}"))`,
-    `(deny file-read* (subpath "${join(home, '.codex')}"))`,
-    `(deny file-read* (subpath "${join(home, '.grok')}"))`,
+    ...deniedReads.map((dir) => `(deny file-read* (subpath "${join(home, dir)}"))`),
     `(deny file-read* (subpath "${join(home, '.ssh')}"))`,
     `(deny file-write* (subpath "${join(home, 'chromatin')}"))`,
   ].join('\n')
@@ -2844,7 +2861,7 @@ class CursorAdapter implements EngineAdapter {
     const resume = args.resumeSessionId ? ['--resume', args.resumeSessionId] : []
     const base = ['-p', ...resume, ...model, '--output-format', 'stream-json', '--force', '--trust']
     const spawnArgs = wantsStdinPrompt ? base : [...base, prompt]
-    const constrained = constrainCursorSpawn(command, spawnArgs, shell)
+    const constrained = constrainTurnSpawn('cursor', command, spawnArgs, shell)
     return spawnCursorStream(constrained.command, constrained.args, {
       cwd: args.cwd, env: args.env, signal: args.signal, onLog: args.onLog, shell: constrained.shell,
       stdinText: wantsStdinPrompt ? prompt : undefined,
@@ -2868,7 +2885,7 @@ class CursorAdapter implements EngineAdapter {
     const model = args.model ? ['--model', args.model] : []
     const base = ['--mode', 'ask', '-p', '--output-format', 'stream-json', ...model, '--trust']
     const spawnArgs = wantsStdinPrompt ? base : [...base, prompt]
-    const constrained = constrainCursorSpawn(command, spawnArgs, shell)
+    const constrained = constrainTurnSpawn('cursor', command, spawnArgs, shell)
     return spawnCursorStream(constrained.command, constrained.args, {
       cwd: args.cwd, env: args.env, signal: args.signal, onLog: args.onLog, shell: constrained.shell,
       stdinText: wantsStdinPrompt ? prompt : undefined,
@@ -2936,7 +2953,7 @@ class CursorAdapter implements EngineAdapter {
       const { command, shell, wantsStdinPrompt } = resolveSpawn(this.bin)
       const base = [...flags, ...resume, '-p']
       const spawnArgs = wantsStdinPrompt ? base : [...base, args.prompt]
-      const constrained = constrainCursorSpawn(command, spawnArgs, shell)
+      const constrained = constrainTurnSpawn('cursor', command, spawnArgs, shell)
       return spawnEngine(constrained.command, constrained.args, args, { shell: constrained.shell, stdinText: wantsStdinPrompt ? args.prompt : undefined })
     }
     return this.turn(args.prompt, {
