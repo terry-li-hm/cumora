@@ -212,7 +212,7 @@ CREATE TABLE IF NOT EXISTS agent_triages (
   id                    TEXT PRIMARY KEY,
   agent_id              TEXT NOT NULL,
   company_id            TEXT,
-  source                TEXT NOT NULL,                 -- cloud | byoa-claude | byoa-codex | byoa-pi
+  source                TEXT NOT NULL,                 -- cloud | byoa-claude | byoa-codex | byoa-pi | byoa-cursor
   model                 TEXT,
   actionable            BOOLEAN NOT NULL DEFAULT FALSE, -- verdict: woke the big brain?
   reason                TEXT,
