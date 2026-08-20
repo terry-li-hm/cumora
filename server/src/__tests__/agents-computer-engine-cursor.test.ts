@@ -101,6 +101,8 @@ test('cursor seedHome writes AGENTS.md and common home directories', { skip: IS_
   assert.match(agents, /Implement only\./)
   assert.match(agents, /`AGENTS\.md` \(this file\)/)
   assert.match(agents, /`\.cursor\/skills\/` — your skills/)
+  assert.match(agents, /`chromatin\/` — the operator's read-only note vault/)
+  assert.ok(existsSync(join(f.home, 'chromatin')))
   assert.doesNotMatch(agents, /CLAUDE\.md|\.claude\/skills/)
   assert.ok(existsSync(join(f.home, 'memory', 'MEMORY.md')))
   assert.ok(existsSync(join(f.home, 'workspace')))

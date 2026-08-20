@@ -4,7 +4,7 @@
  * A Computer is the host an agent runs on (see docs/BYOA.md). Cumora Cloud
  * is the built-in managed computer; the user pairs their own machines (a
  * Mac, a VPS) which run the `cumora agent computer` daemon and a local
- * engine (Claude Code / Codex / Grok Build / Cursor Agent).
+ * engine (Claude Code / Codex / Grok Build / pi / Cursor Agent).
  *
  * This module owns the data-access + credential plumbing so the route
  * layer (api/router.ts) stays thin and this logic stays unit-testable:
@@ -20,7 +20,7 @@ import { publish, CH_STATUS } from '../../redis.js'
 import { signAgentToken } from '../runtime/jwt.js'
 
 export type ComputerKind = 'cloud' | 'local' | 'vps'
-export type EngineId = 'managed' | 'claude' | 'codex' | 'grok' | 'cursor'
+export type EngineId = 'managed' | 'claude' | 'codex' | 'grok' | 'pi' | 'cursor'
 export type ComputerStatus = 'online' | 'offline' | 'busy'
 
 /** How long a paired computer can go without a heartbeat before the sweep
@@ -45,7 +45,7 @@ export async function announceComputerOnline(computerId: string, companyId: stri
 }
 
 /** Engines a paired (non-cloud) computer is allowed to advertise. */
-const PAIRABLE_ENGINES: ReadonlySet<string> = new Set(['claude', 'codex', 'grok', 'cursor'])
+export const PAIRABLE_ENGINES: ReadonlySet<string> = new Set(['claude', 'codex', 'grok', 'pi', 'cursor'])
 
 export interface ComputerRow {
   id: string
@@ -350,7 +350,8 @@ export async function mintAgentRuntimeToken(args: {
  *
  *  When a row has no explicit model, fall back to the deploy-level default
  *  (CUMORA_DEFAULT_CLAUDE_MODEL / CUMORA_DEFAULT_CODEX_MODEL /
- *  CUMORA_DEFAULT_GROK_MODEL / CUMORA_DEFAULT_CURSOR_MODEL) so every BYOA
+ *  CUMORA_DEFAULT_GROK_MODEL / CUMORA_DEFAULT_PI_MODEL /
+ *  CUMORA_DEFAULT_CURSOR_MODEL) so every BYOA
  *  daemon gets a consistent pin — independent of whatever model the local
  *  engine CLI happens to default to today. Critical: a model
  *  upgrade in the underlying CLI (e.g. claude 4.7 → 4.8) silently changes
@@ -367,10 +368,11 @@ export async function listAgentsForComputer(computerId: string): Promise<
   const claudeDefault = process.env.CUMORA_DEFAULT_CLAUDE_MODEL?.trim() || null
   const codexDefault = process.env.CUMORA_DEFAULT_CODEX_MODEL?.trim() || null
   const grokDefault = process.env.CUMORA_DEFAULT_GROK_MODEL?.trim() || null
+  const piDefault = process.env.CUMORA_DEFAULT_PI_MODEL?.trim() || null
   const cursorDefault = process.env.CUMORA_DEFAULT_CURSOR_MODEL?.trim() || null
   return rows.map((r) => {
     if (r.model) return r
-    const dflt = r.engine === 'codex' ? codexDefault : r.engine === 'claude' ? claudeDefault : r.engine === 'grok' ? grokDefault : r.engine === 'cursor' ? cursorDefault : null
+    const dflt = r.engine === 'codex' ? codexDefault : r.engine === 'claude' ? claudeDefault : r.engine === 'grok' ? grokDefault : r.engine === 'pi' ? piDefault : r.engine === 'cursor' ? cursorDefault : null
     return dflt ? { ...r, model: dflt } : r
   })
 }

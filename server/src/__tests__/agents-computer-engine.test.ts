@@ -4,6 +4,7 @@
  * Run: node --import tsx --test server/src/__tests__/agents-computer-engine.test.ts
  */
 import assert from 'node:assert/strict'
+import { existsSync } from 'node:fs'
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -117,6 +118,8 @@ test('grok adapter seeds AGENTS.md and reports sessionId from stream-json', asyn
   await adapter.seedHome(home, { id: 'iris', name: 'Iris', role: 'Designer', systemPrompt: null })
   const agentsMd = await readFile(join(home, 'AGENTS.md'), 'utf8')
   assert.match(agentsMd, /Iris/)
+  assert.match(agentsMd, /`chromatin\/` — the operator's read-only note vault/)
+  assert.ok(existsSync(join(home, 'chromatin')))
 
   const result = await adapter.run({
     home,
