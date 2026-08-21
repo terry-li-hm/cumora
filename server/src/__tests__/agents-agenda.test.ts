@@ -330,6 +330,22 @@ test('classifyAgendaActionable: empty agenda short-circuits before the LLM call'
   assert.equal(called, false, 'must not call the LLM when there is nothing to triage')
 })
 
+test('classifyAgendaActionable leaves output headroom beyond reasoning tokens', async () => {
+  let maxOutputTokens = 0
+  __setLlmClientOverrideForTesting((async () => ({
+    responses: {
+      create: async (request: { max_output_tokens?: number }) => {
+        maxOutputTokens = request.max_output_tokens ?? 0
+        return { output_text: JSON.stringify({ actionable: false, focus: '', reason: 'done' }) }
+      },
+    },
+  })) as unknown as Parameters<typeof __setLlmClientOverrideForTesting>[0])
+  await classifyAgendaActionable({
+    persona: STUB_PERSONA, companyId: 'c1', agenda: SINGLE_CARD_AGENDA,
+  })
+  assert.ok(maxOutputTokens >= 600, 'reasoning must not consume the whole structured-output budget')
+})
+
 test('classifyAgendaActionable: happy path with strict boolean true', async () => {
   stubLlm(JSON.stringify({ actionable: true, focus: 'Ship it', reason: 'one card' }))
   const v = await classifyAgendaActionable({
