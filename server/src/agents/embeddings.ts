@@ -14,8 +14,8 @@
  * break the entire wake cycle.
  */
 import OpenAI from 'openai'
-import { env } from '../env.js'
 import { pool } from '../db/pool.js'
+import { env } from '../env.js'
 
 const EMBED_MODEL = 'text-embedding-3-small'
 const EMBED_DIM = 1536
@@ -42,6 +42,7 @@ export function __setEmbedTextOverrideForTesting(fn: typeof testEmbedOverride): 
 export async function embedText(text: string): Promise<string | null> {
   const trimmed = (text ?? '').trim()
   if (!trimmed) return null
+  if (env.SERVER_LLM_DISABLED) return null
   if (testEmbedOverride) return testEmbedOverride(trimmed)
   try {
     const resp = await client.embeddings.create({
@@ -78,6 +79,7 @@ export async function hasPgVector(): Promise<boolean> {
  *  so a large agent (thousands of memories) doesn't burst OpenAI's
  *  rate limit. Fire-and-forget at server boot. */
 export async function backfillMemoryEmbeddings(opts: { batchSize?: number; delayMs?: number } = {}): Promise<void> {
+  if (env.SERVER_LLM_DISABLED) return
   const batchSize = opts.batchSize ?? 50
   const delayMs = opts.delayMs ?? 80
   if (!(await hasPgVector())) return

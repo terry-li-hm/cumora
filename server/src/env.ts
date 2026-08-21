@@ -36,6 +36,13 @@ export const env = {
   REDIS_URL: required('REDIS_URL', 'redis://localhost:6379'),
   OPENAI_API_KEY: required('OPENAI_API_KEY'),
   /**
+   * Hard stop for every server-originated model call. Private BYOA-only
+   * deployments use this to ensure room, agenda, memory, and utility payloads
+   * cannot fall through to the server's API-key provider. Local paired engines
+   * do not use this client factory and remain available.
+   */
+  SERVER_LLM_DISABLED: /^(true|1|yes|on)$/i.test(process.env.CUMORA_DISABLE_SERVER_LLM ?? ''),
+  /**
    * "Brain" model — the agent's main reasoning loop and convene speech.
    * Default model used when an agent's `participants.model` is NULL.
    * Per-agent overrides live on the agent row in DB and are edited from

@@ -3,6 +3,9 @@
  *
  * Routing rules (tenant-aware):
  *
+ *   0. If CUMORA_DISABLE_SERVER_LLM is enabled, fail before resolving or
+ *      constructing any provider client. BYOA engines use a separate path.
+ *
  *   1. If sub2api is configured AND we can resolve the tenant's owner
  *      → that owner's sub2api_api_key → OpenAI client pointed at the
  *      sub2api OpenAI-compatible base. Per-user quotas enforced.
@@ -66,8 +69,12 @@ export function __setLlmClientOverrideForTesting(fn: typeof testLlmOverride): vo
 
 /** Build (and cache) the OpenAI client for this tenant. Async because
  *  resolving the tenant's owner_user_id + sub2api_api_key is a DB hop.
- *  Always returns a working client — never throws on lookup failure. */
+ *  Provider lookup failures fall back to the legacy client. The explicit
+ *  BYOA-only kill switch throws before any lookup or client construction. */
 export async function getLlmClient(tenant: string | null): Promise<OpenAI> {
+  if (env.SERVER_LLM_DISABLED) {
+    throw new Error('server-side LLM calls are disabled by CUMORA_DISABLE_SERVER_LLM')
+  }
   if (testLlmOverride) return testLlmOverride(tenant)
   // No tenant context → legacy.
   if (!tenant || !sub2apiConfigured()) return legacyClient()
