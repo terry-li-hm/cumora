@@ -380,6 +380,18 @@ CREATE TABLE IF NOT EXISTS conversation_mutes (
 -- have to ALTER the existing row in.
 ALTER TABLE conversation_mutes ADD COLUMN IF NOT EXISTS muted_until TIMESTAMP WITH TIME ZONE;
 
+-- Per-user conversation archive. Archiving hides clutter without deleting
+-- messages or changing what other members can see. A row can be removed to
+-- restore the conversation, so cleanup remains fully reversible.
+CREATE TABLE IF NOT EXISTS conversation_archives (
+  user_id          TEXT NOT NULL,
+  conversation_id  TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+  archived_at      TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (user_id, conversation_id)
+);
+CREATE INDEX IF NOT EXISTS idx_conversation_archives_user
+  ON conversation_archives(user_id, archived_at DESC);
+
 -- ============== Per-agent workspace (virtual filesystem) ==============
 CREATE TABLE IF NOT EXISTS agent_workspace (
   agent_id   TEXT NOT NULL,
@@ -554,6 +566,29 @@ UPDATE agent_log           SET company_id = 'personal' WHERE company_id IS NULL;
 UPDATE agent_tasks         SET company_id = 'personal' WHERE company_id IS NULL;
 UPDATE agent_runs          SET company_id = 'personal' WHERE company_id IS NULL;
 UPDATE agent_events        SET company_id = 'personal' WHERE company_id IS NULL;
+
+-- Off-boarded agents no longer belong in active group rosters. Keep direct
+-- chats intact because their two-member identity carries recoverable history;
+-- archive choices are per-user and a migration cannot infer which non-empty
+-- histories each person still wants visible.
+-- WITH ORDINALITY preserves the original member order while removing only
+-- departed agents from groups. This is idempotent on every boot.
+UPDATE conversations c
+   SET members = COALESCE((
+         SELECT jsonb_agg(to_jsonb(member.id) ORDER BY member.ord)
+           FROM jsonb_array_elements_text(c.members) WITH ORDINALITY AS member(id, ord)
+           LEFT JOIN participants p
+             ON p.id = member.id AND p.company_id = c.company_id
+          WHERE NOT COALESCE(p.kind = 'agent' AND p.departed_at IS NOT NULL, FALSE)
+       ), '[]'::jsonb)
+ WHERE c.kind = 'group'
+   AND EXISTS (
+         SELECT 1
+           FROM jsonb_array_elements_text(c.members) AS member(id)
+           JOIN participants p
+             ON p.id = member.id AND p.company_id = c.company_id
+          WHERE p.kind = 'agent' AND p.departed_at IS NOT NULL
+       );
 
 -- Backfill per-agent data with the agent's REAL company instead of the
 -- 'personal' placeholder above. The original null-backfill predates the
@@ -2185,9 +2220,13 @@ async function schemaAlreadyCurrent(client: import('pg').PoolClient): Promise<bo
         -- this sentinel a 40P01 fallback would skip CREATE TABLE and every
         -- dashboard query would 500 on "relation llm_calls_rollup does not exist".
         AND (SELECT count(*) FROM pg_class WHERE relname = 'llm_calls_rollup') > 0
-        -- Shipping is the latest product-domain addition. Never take the
-        -- lock-contention shortcut on a pod that has not created its core table.
+        -- Shipping is a product-domain addition. Never take the lock-contention
+        -- shortcut on a pod that has not created its core table.
         AND (SELECT count(*) FROM pg_class WHERE relname = 'shipping_features') > 0
+        -- Per-user conversation archiving is required by every list/search
+        -- query in this release. If its DDL rolled back under contention, boot
+        -- must retry rather than declaring the older schema current.
+        AND (SELECT count(*) FROM pg_class WHERE relname = 'conversation_archives') > 0
         AS ok
     `)
     return rows[0]?.ok === true

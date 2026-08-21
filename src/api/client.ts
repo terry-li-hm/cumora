@@ -158,6 +158,7 @@ export interface ApiConversation {
   projectColor: string | null
   createdAt: string
   updatedAt: string
+  archivedAt: string | null
   unreadCount: number
   lastMessage: {
     id: string
@@ -935,7 +936,12 @@ export const api = {
     http<{ ok: boolean }>(`/agents/${encodeURIComponent(id)}/rehire`, { method: 'POST' }),
   generateAgentAvatar: (id: string) =>
     http<{ url: string }>(`/agents/${encodeURIComponent(id)}/avatar/generate`, { method: 'POST' }),
-  getConversations: () => http<ApiConversation[]>('/conversations'),
+  getConversations: (includeArchived = false) =>
+    http<ApiConversation[]>(`/conversations${includeArchived ? '?includeArchived=true' : ''}`),
+  archiveConversation: (conversationId: string, archive = true) =>
+    http<{ ok: boolean; archived: boolean }>(`/conversations/${encodeURIComponent(conversationId)}/archive`, {
+      method: 'POST', body: JSON.stringify({ archive }),
+    }),
   createGroup: (input: { title: string; members: string[]; subtitle?: string; projectId?: string | null }) =>
     http<{ id: string; members: string[]; projectId: string | null }>('/conversations', {
       method: 'POST',

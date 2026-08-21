@@ -6,6 +6,10 @@ import { createPoll, castVote, closePoll, PollError } from '../polls.js'
 import { env } from '../env.js'
 import { startConvene, getActiveConvene } from '../agents/convene.js'
 import { getTriageEconomics } from '../agents/observability.js'
+import {
+  insertMembershipSystemMessage, publishMembershipSystemMessage,
+  type PersistedMembershipMessage,
+} from '../agents/membership.js'
 import { BUSY_STATUS_LEASE_MS } from '../status.js'
 import { notifyMessage, computeMessageRecipients } from '../push.js'
 import { randomUUID, randomBytes, createHash, timingSafeEqual } from 'node:crypto'
@@ -2495,20 +2499,68 @@ api.delete('/agents/:id', async (req, res) => {
   // it from every conversation's wake roster — destructive, owner/admin only.
   const { companyId: tenant } = await requireCompanyRole(req)
   const id = req.params.id
-  const { rows: existing } = await pool.query<{ kind: string; departed_at: string | null }>(
-    `SELECT kind, departed_at FROM participants WHERE id = $1 AND company_id = $2`, [id, tenant],
-  )
-  if (!existing[0]) { res.status(404).json({ error: 'not found' }); return }
-  if (existing[0].kind !== 'agent') { res.status(400).json({ error: 'cannot off-board non-agent participant' }); return }
-  if (existing[0].departed_at) { res.status(409).json({ error: 'already off-boarded' }); return }
-  await pool.query(
-    `UPDATE participants
-        SET departed_at = NOW(),
-            status = 'resting',
-            status_updated_at = NOW()
-      WHERE id = $1 AND company_id = $2`,
-    [id, tenant],
-  )
+  // Lock the participant row until both the departure and group-roster update
+  // commit. Group-add paths take a shared lock on the same row, so neither can
+  // race the other into restoring stale membership.
+  const db = await pool.connect()
+  try {
+    await db.query('BEGIN')
+    const { rows: existing } = await db.query<{ kind: string; departed_at: string | null }>(
+      `SELECT kind, departed_at FROM participants
+        WHERE id = $1 AND company_id = $2
+        FOR UPDATE`,
+      [id, tenant],
+    )
+    if (!existing[0]) { await db.query('ROLLBACK'); res.status(404).json({ error: 'not found' }); return }
+    if (existing[0].kind !== 'agent') { await db.query('ROLLBACK'); res.status(400).json({ error: 'cannot off-board non-agent participant' }); return }
+    if (existing[0].departed_at) { await db.query('ROLLBACK'); res.status(409).json({ error: 'already off-boarded' }); return }
+    await db.query(
+      `UPDATE participants
+          SET departed_at = NOW(),
+              status = 'resting',
+              status_updated_at = NOW()
+        WHERE id = $1 AND company_id = $2`,
+      [id, tenant],
+    )
+    // Direct chats retain their two-member identity and history. Group rosters
+    // should reflect who can still participate, so remove the departed agent
+    // without deleting any conversation or message rows. `departed_at` is the
+    // single control-plane audit record; do not inject one synthetic message per
+    // historical group and wake every remaining member during off-boarding.
+    await db.query(
+      `UPDATE conversations
+          SET members = members - $1,
+              updated_at = NOW()
+        WHERE company_id = $2
+          AND kind = 'group'
+          AND members ? $1`,
+      [id, tenant],
+    )
+    // Preserve direct-chat history but move it out of every human member's
+    // active list. The participant lock makes this compose safely with an
+    // in-flight explicit DM open: whichever finishes last determines whether
+    // the agent was still active, and an off-board always finishes archived.
+    await db.query(
+      `INSERT INTO conversation_archives (user_id, conversation_id, archived_at)
+       SELECT member.id, c.id, NOW()
+         FROM conversations c
+         CROSS JOIN LATERAL jsonb_array_elements_text(c.members) AS member(id)
+         JOIN participants p
+           ON p.id = member.id AND p.company_id = c.company_id AND p.kind = 'human'
+        WHERE c.company_id = $2
+          AND c.kind = 'direct'
+          AND c.members ? $1
+       ON CONFLICT (user_id, conversation_id)
+       DO UPDATE SET archived_at = EXCLUDED.archived_at`,
+      [id, tenant],
+    )
+    await db.query('COMMIT')
+  } catch (err) {
+    await db.query('ROLLBACK').catch(() => {})
+    throw err
+  } finally {
+    db.release()
+  }
   const { invalidatePersonaCache } = await import('../agents/personas.js')
   invalidatePersonaCache(id)
   // Reclaim the agent's chrome-profile PVC. Off-board is the agent's
@@ -2695,6 +2747,7 @@ api.post('/agents/:id/rehire', async (req, res) => {
 
 api.get('/conversations', async (req, res) => {
   const { userId: me, companyId: tenant } = await requireCompany(req)
+  const includeArchived = req.query.includeArchived === 'true'
   const { rows } = await pool.query(
     `SELECT
         c.id, c.kind,
@@ -2705,6 +2758,7 @@ api.get('/conversations', async (req, res) => {
         c.subtitle, c.topic, c.members, c.pinned, c.tag, c.pulled_by AS "pulledBy",
         c.project_id AS "projectId", p.name AS "projectName", p.color AS "projectColor",
         c.created_at AS "createdAt", c.updated_at AS "updatedAt",
+        ca.archived_at AS "archivedAt",
         -- Per-user mute. Expired mutes naturally evaluate to false so an
         -- "until tomorrow" silence wears off without needing a sweeper job.
         (mu.user_id IS NOT NULL AND (mu.muted_until IS NULL OR mu.muted_until > NOW())) AS muted,
@@ -2750,6 +2804,7 @@ api.get('/conversations', async (req, res) => {
       FROM conversations c
       LEFT JOIN projects p ON p.id = c.project_id
       LEFT JOIN conversation_mutes mu ON mu.conversation_id = c.id AND mu.user_id = $1
+      LEFT JOIN conversation_archives ca ON ca.conversation_id = c.id AND ca.user_id = $1
       LEFT JOIN LATERAL (
         SELECT p_other.name
           FROM jsonb_array_elements_text(c.members) WITH ORDINALITY AS member(id, ord)
@@ -2767,10 +2822,35 @@ api.get('/conversations', async (req, res) => {
         -- — those are private to the agents and surfaced only via the
         -- "Whispers" peek tab.
         AND c.members @> to_jsonb(ARRAY[$1::text])
+        AND ($3::boolean OR ca.conversation_id IS NULL)
       ORDER BY c.pinned DESC, c.updated_at DESC`,
-    [me, tenant],
+    [me, tenant, includeArchived],
   )
   res.json(rows)
+})
+
+/** Hide or restore one conversation for the current user without deleting
+ * shared history. Archiving is deliberately per-user: other members keep the
+ * room unless they archive it themselves. */
+api.post('/conversations/:id/archive', async (req, res) => {
+  const { id } = req.params
+  const { userId: me } = await requireConversationMember(req, id)
+  const archive = req.body?.archive !== false
+  if (archive) {
+    await pool.query(
+      `INSERT INTO conversation_archives (user_id, conversation_id, archived_at)
+       VALUES ($1, $2, NOW())
+       ON CONFLICT (user_id, conversation_id)
+       DO UPDATE SET archived_at = EXCLUDED.archived_at`,
+      [me, id],
+    )
+  } else {
+    await pool.query(
+      `DELETE FROM conversation_archives WHERE user_id = $1 AND conversation_id = $2`,
+      [me, id],
+    )
+  }
+  res.json({ ok: true, archived: archive })
 })
 
 /**
@@ -2790,33 +2870,48 @@ api.post('/conversations', async (req, res) => {
   if (!title) { res.status(400).json({ error: 'title required' }); return }
   if (members.length < 2) { res.status(400).json({ error: 'pick at least one teammate' }); return }
 
-  // Validate every member exists in this tenant.
-  const { rows: existing } = await pool.query<{ id: string }>(
-    `SELECT id FROM participants WHERE id = ANY($1::text[]) AND company_id = $2`,
-    [members, tenant],
-  )
-  const validIds = new Set(existing.map((r) => r.id))
-  const missing = members.filter((m) => !validIds.has(m))
-  if (missing.length > 0) {
-    res.status(400).json({ error: `unknown participant(s): ${missing.join(', ')}` }); return
-  }
-
-  // If a project was specified, validate it exists in this tenant.
-  if (projectId) {
-    const { rows: pj } = await pool.query(
-      `SELECT 1 FROM projects WHERE id = $1 AND company_id = $2 LIMIT 1`,
-      [projectId, tenant],
-    )
-    if (!pj[0]) { res.status(400).json({ error: 'unknown project' }); return }
-  }
-
   const id = `g-${randomUUID().slice(0, 8)}`
-  await pool.query(
-    `INSERT INTO conversations (id, kind, title, topic, members, pinned, tag, pulled_by, company_id, project_id)
-     VALUES ($1, 'group', $2, $3, $4::jsonb, FALSE, NULL, NULL, $5, $6)`,
-    [id, title, topic, JSON.stringify(members), tenant, projectId],
-  )
-  await pool.query(`INSERT INTO conversation_counters (conversation_id, next_sequence) VALUES ($1, 1)`, [id])
+  const db = await pool.connect()
+  try {
+    await db.query('BEGIN')
+    // Shared locks keep every selected participant active until the group row
+    // commits. A concurrent off-board waits, then removes that agent afterward.
+    const { rows: existing } = await db.query<{ id: string }>(
+      `SELECT id FROM participants
+        WHERE id = ANY($1::text[]) AND company_id = $2 AND departed_at IS NULL
+        FOR SHARE`,
+      [members, tenant],
+    )
+    const validIds = new Set(existing.map((r) => r.id))
+    const missing = members.filter((m) => !validIds.has(m))
+    if (missing.length > 0) {
+      await db.query('ROLLBACK')
+      res.status(400).json({ error: `unknown participant(s): ${missing.join(', ')}` })
+      return
+    }
+
+    // If a project was specified, validate it exists in this tenant.
+    if (projectId) {
+      const { rows: pj } = await db.query(
+        `SELECT 1 FROM projects WHERE id = $1 AND company_id = $2 LIMIT 1`,
+        [projectId, tenant],
+      )
+      if (!pj[0]) { await db.query('ROLLBACK'); res.status(400).json({ error: 'unknown project' }); return }
+    }
+
+    await db.query(
+      `INSERT INTO conversations (id, kind, title, topic, members, pinned, tag, pulled_by, company_id, project_id)
+       VALUES ($1, 'group', $2, $3, $4::jsonb, FALSE, NULL, NULL, $5, $6)`,
+      [id, title, topic, JSON.stringify(members), tenant, projectId],
+    )
+    await db.query(`INSERT INTO conversation_counters (conversation_id, next_sequence) VALUES ($1, 1)`, [id])
+    await db.query('COMMIT')
+  } catch (err) {
+    await db.query('ROLLBACK').catch(() => {})
+    throw err
+  } finally {
+    db.release()
+  }
   res.status(201).json({ id, members, projectId })
 })
 
@@ -2882,33 +2977,61 @@ api.post('/conversations/direct', async (req, res) => {
   const otherId = String(req.body?.otherId ?? '').trim()
   if (!otherId) { res.status(400).json({ error: 'otherId required' }); return }
   if (otherId === me) { res.status(400).json({ error: 'cannot DM yourself' }); return }
-  const { rows: pp } = await pool.query<{ id: string; kind: string }>(
-    `SELECT id, kind FROM participants WHERE id = $1 AND company_id = $2`, [otherId, tenant],
-  )
-  if (!pp[0]) { res.status(404).json({ error: 'unknown participant' }); return }
+  let result: { id: string; created: boolean } | null = null
+  const db = await pool.connect()
+  try {
+    await db.query('BEGIN')
+    // Hold the active participant stable through restore/create. Off-boarding
+    // takes FOR UPDATE on the same row and, if it runs afterward, archives the
+    // direct chat before it commits.
+    const { rows: pp } = await db.query<{ id: string; kind: string; name: string }>(
+      `SELECT id, kind, name FROM participants
+        WHERE id = $1 AND company_id = $2 AND departed_at IS NULL
+        FOR SHARE`,
+      [otherId, tenant],
+    )
+    if (!pp[0]) { await db.query('ROLLBACK'); res.status(404).json({ error: 'unknown participant' }); return }
+    // The participants can open the same DM concurrently. Serialize this exact
+    // unordered pair for the transaction so both requests cannot observe
+    // "missing" and insert duplicate conversations.
+    const pairKey = `direct:${tenant}:${[me, otherId].sort().join(':')}`
+    await db.query(`SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, [pairKey])
 
-  // Look for an existing direct chat with exactly these two members.
-  const { rows: existing } = await pool.query<{ id: string }>(
-    `SELECT id FROM conversations
-      WHERE kind = 'direct' AND company_id = $3
-        AND members @> to_jsonb(ARRAY[$1::text]) AND members @> to_jsonb(ARRAY[$2::text])
-        AND jsonb_array_length(members) = 2
-      ORDER BY updated_at DESC LIMIT 1`,
-    [me, otherId, tenant],
-  )
-  if (existing[0]) { res.json({ id: existing[0].id, created: false }); return }
-
-  const id = `direct-${otherId}-${randomUUID().slice(0, 6)}`
-  const { rows: title } = await pool.query<{ name: string }>(
-    `SELECT name FROM participants WHERE id = $1 AND company_id = $2`, [otherId, tenant],
-  )
-  await pool.query(
-    `INSERT INTO conversations (id, kind, title, subtitle, members, pinned, tag, company_id)
-     VALUES ($1, 'direct', $2, NULL, $3::jsonb, FALSE, $4, $5)`,
-    [id, title[0]?.name ?? otherId, JSON.stringify([me, otherId]), pp[0].kind === 'human' ? 'human' : null, tenant],
-  )
-  await pool.query(`INSERT INTO conversation_counters (conversation_id, next_sequence) VALUES ($1, 1)`, [id])
-  res.status(201).json({ id, created: true })
+    // Look for an existing direct chat with exactly these two members.
+    const { rows: existing } = await db.query<{ id: string }>(
+      `SELECT id FROM conversations
+        WHERE kind = 'direct' AND company_id = $3
+          AND members @> to_jsonb(ARRAY[$1::text]) AND members @> to_jsonb(ARRAY[$2::text])
+          AND jsonb_array_length(members) = 2
+        ORDER BY updated_at DESC LIMIT 1`,
+      [me, otherId, tenant],
+    )
+    if (existing[0]) {
+      // Explicitly opening a DM is also an intent to bring it back into view.
+      await db.query(
+        `DELETE FROM conversation_archives WHERE user_id = $1 AND conversation_id = $2`,
+        [me, existing[0].id],
+      )
+      result = { id: existing[0].id, created: false }
+    } else {
+      const id = `direct-${otherId}-${randomUUID().slice(0, 6)}`
+      await db.query(
+        `INSERT INTO conversations (id, kind, title, subtitle, members, pinned, tag, company_id)
+         VALUES ($1, 'direct', $2, NULL, $3::jsonb, FALSE, $4, $5)`,
+        [id, pp[0].name ?? otherId, JSON.stringify([me, otherId]), pp[0].kind === 'human' ? 'human' : null, tenant],
+      )
+      await db.query(`INSERT INTO conversation_counters (conversation_id, next_sequence) VALUES ($1, 1)`, [id])
+      result = { id, created: true }
+    }
+    await db.query('COMMIT')
+  } catch (err) {
+    await db.query('ROLLBACK').catch(() => {})
+    throw err
+  } finally {
+    db.release()
+  }
+  if (!result) throw new Error('direct conversation transaction completed without a result')
+  res.status(result.created ? 201 : 200).json(result)
 })
 
 /** Toggle (or set) the pinned state of a conversation. */
@@ -2996,58 +3119,98 @@ api.post('/conversations/:id/members', async (req, res) => {
   const { id } = req.params
   const newMember = String(req.body?.id ?? '').trim()
   if (!newMember) { res.status(400).json({ error: 'id required' }); return }
-  const { rows } = await pool.query<{ kind: string; members: string[] }>(
-    `SELECT kind, members FROM conversations WHERE id = $1 AND company_id = $2`, [id, tenant],
-  )
-  const c = rows[0]
-  if (!c) { res.status(404).json({ error: 'not found' }); return }
-  if (c.kind !== 'group') { res.status(400).json({ error: `cannot add to a ${c.kind} conversation` }); return }
-  if (!c.members.includes(me)) { res.status(403).json({ error: 'only members can add others' }); return }
-  if (c.members.includes(newMember)) { res.json({ ok: true, members: c.members, alreadyIn: true }); return }
-  // Validate participant exists in this tenant.
-  const { rows: existing } = await pool.query<{ id: string }>(
-    `SELECT id FROM participants WHERE id = $1 AND company_id = $2`, [newMember, tenant],
-  )
-  if (!existing[0]) { res.status(400).json({ error: `unknown participant: ${newMember}` }); return }
-  const next = [...c.members, newMember]
-  await pool.query(
-    `UPDATE conversations SET members = $2::jsonb, updated_at = NOW() WHERE id = $1 AND company_id = $3`,
-    [id, JSON.stringify(next), tenant],
-  )
-  const { postMembershipSystemMessage } = await import('../agents/membership.js')
-  await postMembershipSystemMessage({
-    conversationId: id, companyId: tenant, actorId: me,
-    kind: 'joined', participantId: newMember,
+  let next: string[] = []
+  let membershipNotice: PersistedMembershipMessage | null = null
+  const db = await pool.connect()
+  try {
+    await db.query('BEGIN')
+    // Take the participant lock first, matching off-board/create-group lock
+    // order. This avoids a conversation→participant / participant→conversation
+    // deadlock while still closing the stale-membership race.
+    const { rows: existing } = await db.query<{ id: string }>(
+      `SELECT id FROM participants
+        WHERE id = $1 AND company_id = $2 AND departed_at IS NULL
+        FOR SHARE`,
+      [newMember, tenant],
+    )
+    if (!existing[0]) { await db.query('ROLLBACK'); res.status(400).json({ error: `unknown participant: ${newMember}` }); return }
+    const { rows } = await db.query<{ kind: string; members: string[] }>(
+      `SELECT kind, members FROM conversations
+        WHERE id = $1 AND company_id = $2
+        FOR UPDATE`,
+      [id, tenant],
+    )
+    const c = rows[0]
+    if (!c) { await db.query('ROLLBACK'); res.status(404).json({ error: 'not found' }); return }
+    if (c.kind !== 'group') { await db.query('ROLLBACK'); res.status(400).json({ error: `cannot add to a ${c.kind} conversation` }); return }
+    if (!c.members.includes(me)) { await db.query('ROLLBACK'); res.status(403).json({ error: 'only members can add others' }); return }
+    if (c.members.includes(newMember)) { await db.query('COMMIT'); res.json({ ok: true, members: c.members, alreadyIn: true }); return }
+    next = [...c.members, newMember]
+    await db.query(
+      `UPDATE conversations SET members = $2::jsonb, updated_at = NOW()
+        WHERE id = $1 AND company_id = $3`,
+      [id, JSON.stringify(next), tenant],
+    )
+    membershipNotice = await insertMembershipSystemMessage({
+      conversationId: id, companyId: tenant, actorId: me,
+      kind: 'joined', participantId: newMember,
+    }, db)
+    await db.query('COMMIT')
+  } catch (err) {
+    await db.query('ROLLBACK').catch(() => {})
+    throw err
+  } finally {
+    db.release()
+  }
+  if (!membershipNotice) throw new Error('membership transaction completed without an audit message')
+  await publishMembershipSystemMessage(membershipNotice).catch((err) => {
+    console.warn('[membership] joined row committed but publish failed:', err instanceof Error ? err.message : String(err))
   })
   res.json({ ok: true, members: next })
 })
 
-/** Leave a group conversation — removes the caller from members.
- *  Posts the `left` system row BEFORE the members mutation so the
- *  caller's mailbox surfaces this final row in their next wake (the
- *  inbox query filters by current `c.members @> [me]`). */
+/** Leave a group conversation. Persist the audit row and roster mutation in
+ * one transaction, then publish only after commit so retries cannot create a
+ * false or duplicate departure record. */
 api.post('/conversations/:id/leave', async (req, res) => {
   const { userId: me, companyId: tenant } = await requireCompany(req)
   const { id } = req.params
-  const { rows } = await pool.query<{ kind: string; members: string[] }>(
-    `SELECT kind, members FROM conversations WHERE id = $1 AND company_id = $2`, [id, tenant],
-  )
-  const c = rows[0]
-  if (!c) { res.status(404).json({ error: 'not found' }); return }
-  if (c.kind === 'direct') {
-    res.status(400).json({ error: 'cannot leave a direct conversation' }); return
+  let next: string[] = []
+  let membershipNotice: PersistedMembershipMessage | null = null
+  const db = await pool.connect()
+  try {
+    await db.query('BEGIN')
+    const { rows } = await db.query<{ kind: string; members: string[] }>(
+      `SELECT kind, members FROM conversations
+        WHERE id = $1 AND company_id = $2
+        FOR UPDATE`,
+      [id, tenant],
+    )
+    const c = rows[0]
+    if (!c) { await db.query('ROLLBACK'); res.status(404).json({ error: 'not found' }); return }
+    if (c.kind === 'direct') { await db.query('ROLLBACK'); res.status(400).json({ error: 'cannot leave a direct conversation' }); return }
+    if (!c.members.includes(me)) { await db.query('ROLLBACK'); res.status(409).json({ error: 'not a member' }); return }
+    membershipNotice = await insertMembershipSystemMessage({
+      conversationId: id, companyId: tenant, actorId: me,
+      kind: 'left', participantId: me,
+    }, db)
+    next = c.members.filter((m) => m !== me)
+    await db.query(
+      `UPDATE conversations SET members = $2::jsonb, updated_at = NOW()
+        WHERE id = $1 AND company_id = $3`,
+      [id, JSON.stringify(next), tenant],
+    )
+    await db.query('COMMIT')
+  } catch (err) {
+    await db.query('ROLLBACK').catch(() => {})
+    throw err
+  } finally {
+    db.release()
   }
-  if (!c.members.includes(me)) { res.status(409).json({ error: 'not a member' }); return }
-  const { postMembershipSystemMessage } = await import('../agents/membership.js')
-  await postMembershipSystemMessage({
-    conversationId: id, companyId: tenant, actorId: me,
-    kind: 'left', participantId: me,
+  if (!membershipNotice) throw new Error('leave transaction completed without an audit message')
+  await publishMembershipSystemMessage(membershipNotice).catch((err) => {
+    console.warn('[membership] left row committed but publish failed:', err instanceof Error ? err.message : String(err))
   })
-  const next = c.members.filter((m) => m !== me)
-  await pool.query(
-    `UPDATE conversations SET members = $2::jsonb, updated_at = NOW() WHERE id = $1 AND company_id = $3`,
-    [id, JSON.stringify(next), tenant],
-  )
   res.json({ ok: true, members: next })
 })
 
@@ -4306,6 +4469,10 @@ api.get('/search', async (req, res) => {
         WHERE c.company_id = $1
           AND c.kind IN ('direct', 'whisper')
           AND c.members @> to_jsonb(ARRAY[$2::text])
+          AND NOT EXISTS (
+                SELECT 1 FROM conversation_archives ca
+                 WHERE ca.conversation_id = c.id AND ca.user_id = $2
+              )
      )
      SELECT r.id, r.kind, r.title, r.members, r."projectName"
        FROM my_rooms r
@@ -4333,6 +4500,10 @@ api.get('/search', async (req, res) => {
       WHERE c.company_id = $1
         AND c.kind = 'group'
         AND c.members @> to_jsonb(ARRAY[$2::text])
+        AND NOT EXISTS (
+              SELECT 1 FROM conversation_archives ca
+               WHERE ca.conversation_id = c.id AND ca.user_id = $2
+            )
         AND (c.title ILIKE $3 ESCAPE '\\' OR (c.topic IS NOT NULL AND c.topic ILIKE $3 ESCAPE '\\'))
       ORDER BY
         CASE WHEN lower(c.title) = lower($4) THEN 0
@@ -4373,6 +4544,10 @@ api.get('/search', async (req, res) => {
        ) other_participant ON c.kind = 'direct'
       WHERE c.company_id = $1
         AND c.members @> to_jsonb(ARRAY[$2::text])
+        AND NOT EXISTS (
+              SELECT 1 FROM conversation_archives ca
+               WHERE ca.conversation_id = c.id AND ca.user_id = $2
+            )
         AND m.kind = 'text'
         AND m.body ILIKE $3 ESCAPE '\\'
       ORDER BY m.created_at DESC

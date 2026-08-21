@@ -54,6 +54,7 @@ const TABLES_TO_WIPE: readonly string[] = [
   'email_messages',
   'email_contacts',
   'message_reactions',
+  'conversation_archives',
   'conversation_reads',
   'conversation_counters',
   'messages',
