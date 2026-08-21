@@ -7,22 +7,25 @@ import { pool } from './db/pool.js'
  * it — it's purely a referential anchor for the demo data. On first
  * OAuth login, a separate `u-<uuid>` user is created with the real email.
  */
+const CLEAN_LOCAL_SEED = process.env.CUMORA_CLEAN_LOCAL_SEED === '1'
+const LOCAL_USER_ID = 'yetone'
+const LOCAL_USER_NAME = process.env.CUMORA_LOCAL_USER_NAME?.trim() || 'Yetone'
+const LOCAL_USER_EMAIL = process.env.CUMORA_LOCAL_USER_EMAIL?.trim() || 'yetone@dev.local'
+
 async function ensureDevUser(): Promise<void> {
-  const DEV_USER_ID = 'yetone'
-  const DEV_EMAIL = 'yetone@dev.local'
-  const { rows } = await pool.query(`SELECT 1 FROM users WHERE id = $1 LIMIT 1`, [DEV_USER_ID])
+  const { rows } = await pool.query(`SELECT 1 FROM users WHERE id = $1 LIMIT 1`, [LOCAL_USER_ID])
   if (rows[0]) return
   await pool.query(
     `INSERT INTO users (id, email, display_name, password_hash) VALUES ($1, $2, $3, NULL)
      ON CONFLICT (id) DO NOTHING`,
-    [DEV_USER_ID, DEV_EMAIL, 'Yetone'],
+    [LOCAL_USER_ID, LOCAL_USER_EMAIL, LOCAL_USER_NAME],
   )
   await pool.query(
     `INSERT INTO company_members (company_id, user_id, role) VALUES ('personal', $1, 'owner')
      ON CONFLICT DO NOTHING`,
-    [DEV_USER_ID],
+    [LOCAL_USER_ID],
   )
-  console.log(`[seed] placeholder 'yetone' user created (FK anchor for demo data; no login)`)
+  console.log(`[seed] local user '${LOCAL_USER_NAME}' created`)
 }
 
 interface SeedParticipant {
@@ -112,22 +115,39 @@ interface SeedMsg {
 const SEED_MESSAGES: SeedMsg[] = []
 
 export async function seedIfEmpty(): Promise<void> {
-  // Always make sure the dev account exists so login works on a fresh DB.
-  // Email: yetone@dev.local  Password: cumora-dev (DEV ONLY).
+  // Always make sure the local account exists so FK references and the
+  // retained desktop session resolve on a fresh database.
   await ensureDevUser()
 
-  const { rows } = await pool.query<{ count: string }>('SELECT COUNT(*)::text AS count FROM conversations')
+  const countQuery = CLEAN_LOCAL_SEED
+    ? 'SELECT COUNT(*)::text AS count FROM participants'
+    : 'SELECT COUNT(*)::text AS count FROM conversations'
+  const { rows } = await pool.query<{ count: string }>(countQuery)
   const count = Number(rows[0]?.count ?? '0')
   if (count > 0) {
-    console.log(`[seed] skipping — ${count} conversations already in DB`)
+    console.log(`[seed] skipping — clean=${CLEAN_LOCAL_SEED} count=${count}`)
     return
   }
+
+  const participants: SeedParticipant[] = CLEAN_LOCAL_SEED
+    ? [{
+        id: LOCAL_USER_ID,
+        kind: 'human' as const,
+        name: LOCAL_USER_NAME,
+        initial: LOCAL_USER_NAME.charAt(0).toUpperCase() || 'T',
+        avatarBg: 'linear-gradient(135deg, #FF7A6B, #F4B740)',
+        status: 'avail',
+      }]
+    : SEED_PARTICIPANTS
+  const projects: SeedProject[] = CLEAN_LOCAL_SEED ? [] : SEED_PROJECTS
+  const conversations: SeedConvo[] = CLEAN_LOCAL_SEED ? [] : SEED_CONVOS
+  const messages: SeedMsg[] = CLEAN_LOCAL_SEED ? [] : SEED_MESSAGES
 
   const client = await pool.connect()
   try {
     await client.query('BEGIN')
 
-    for (const p of SEED_PARTICIPANTS) {
+    for (const p of participants) {
       await client.query(
         `INSERT INTO participants (id, kind, name, role, initial, avatar_bg, status, bio, tools, company_id)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,'personal')
@@ -136,7 +156,7 @@ export async function seedIfEmpty(): Promise<void> {
       )
     }
 
-    for (const p of SEED_PROJECTS) {
+    for (const p of projects) {
       await client.query(
         `INSERT INTO projects (id, company_id, name, description, color)
          VALUES ($1, 'personal', $2, $3, $4)
@@ -145,20 +165,20 @@ export async function seedIfEmpty(): Promise<void> {
       )
     }
 
-    for (const c of SEED_CONVOS) {
+    for (const c of conversations) {
       await client.query(
         `INSERT INTO conversations (id, kind, title, subtitle, members, pinned, tag, pulled_by, project_id)
          VALUES ($1,$2,$3,$4,$5::jsonb,$6,$7,$8::jsonb,$9)`,
         [c.id, c.kind, c.title, c.subtitle ?? null, JSON.stringify(c.members), c.pinned ?? false, c.tag ?? null, c.pulledBy ? JSON.stringify(c.pulledBy) : null, c.projectId ?? null],
       )
-      const maxSeq = SEED_MESSAGES.filter((m) => m.conversationId === c.id).reduce((a, b) => Math.max(a, b.sequence), 0)
+      const maxSeq = messages.filter((m) => m.conversationId === c.id).reduce((a, b) => Math.max(a, b.sequence), 0)
       await client.query(
         `INSERT INTO conversation_counters (conversation_id, next_sequence) VALUES ($1, $2)`,
         [c.id, maxSeq + 1],
       )
     }
 
-    for (const m of SEED_MESSAGES) {
+    for (const m of messages) {
       await client.query(
         `INSERT INTO messages (id, conversation_id, author_id, kind, body, sequence, reactions, tool, attachment)
          VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8::jsonb,$9::jsonb)`,
@@ -170,8 +190,23 @@ export async function seedIfEmpty(): Promise<void> {
       )
     }
 
+    if (CLEAN_LOCAL_SEED) {
+      // Prevent the normal onboarding path from restoring starter agents,
+      // per-agent DMs, or #all-hands after an intentionally clean reset.
+      await client.query(
+        `UPDATE companies
+            SET owner_user_id = $1,
+                starter_seeded_at = COALESCE(starter_seeded_at, NOW()),
+                starter_dms_seeded_at = COALESCE(starter_dms_seeded_at, NOW()),
+                all_hands_seeded_at = COALESCE(all_hands_seeded_at, NOW()),
+                all_hands_conversation_id = NULL
+          WHERE id = 'personal'`,
+        [LOCAL_USER_ID],
+      )
+    }
+
     await client.query('COMMIT')
-    console.log(`[seed] inserted ${SEED_PARTICIPANTS.length} participants, ${SEED_CONVOS.length} conversations, ${SEED_MESSAGES.length} messages`)
+    console.log(`[seed] inserted ${participants.length} participants, ${conversations.length} conversations, ${messages.length} messages`)
   } catch (e) {
     await client.query('ROLLBACK')
     throw e
