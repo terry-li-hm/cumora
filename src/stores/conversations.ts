@@ -8,6 +8,7 @@ import { useParticipants } from '@/stores/participants'
 
 interface ConversationsState {
   list: Conversation[]
+  archived: Conversation[]
   loaded: boolean
   load: () => Promise<void>
   reload: () => Promise<void>
@@ -132,6 +133,7 @@ function fromApi(c: ApiConversation): Conversation {
     topic: c.topic ?? null,
     members: c.members,
     pinned: c.pinned,
+    archivedAt: c.archivedAt,
     muted: c.muted,
     mutedUntil: c.mutedUntil,
     unread: c.unreadCount > 0 ? c.unreadCount : undefined,
@@ -179,26 +181,35 @@ export function isMuted(c: Pick<Conversation, 'muted' | 'mutedUntil'>): boolean 
 
 export const useConversations = create<ConversationsState>((set) => ({
   list: [],
+  archived: [],
   loaded: false,
   async load() {
     // Clear stale data immediately so a workspace switch never shows the
     // previous tenant's conversations during the loading window.
-    set({ list: [], loaded: false })
+    set({ list: [], archived: [], loaded: false })
+    const companyId = useAuth.getState().activeCompanyId
     try {
-      const list = await api.getConversations()
-      const conversations = list.map(fromApi)
-      set({ list: conversations, loaded: true })
-      refreshActiveMessagesIfSidebarMoved(conversations)
+      const rows = await api.getConversations(true)
+      if (useAuth.getState().activeCompanyId !== companyId) return
+      const conversations = rows.map(fromApi)
+      const list = conversations.filter((c) => !c.archivedAt)
+      const archived = conversations.filter((c) => Boolean(c.archivedAt))
+      set({ list, archived, loaded: true })
+      refreshActiveMessagesIfSidebarMoved(list)
     } catch (err) {
       console.warn('[conversations] load failed', err)
     }
   },
   async reload() {
+    const companyId = useAuth.getState().activeCompanyId
     try {
-      const list = await api.getConversations()
-      const conversations = list.map(fromApi)
-      set({ list: conversations })
-      refreshActiveMessagesIfSidebarMoved(conversations)
+      const rows = await api.getConversations(true)
+      if (useAuth.getState().activeCompanyId !== companyId) return
+      const conversations = rows.map(fromApi)
+      const list = conversations.filter((c) => !c.archivedAt)
+      const archived = conversations.filter((c) => Boolean(c.archivedAt))
+      set({ list, archived })
+      refreshActiveMessagesIfSidebarMoved(list)
     } catch (err) {
       console.warn('[conversations] reload failed', err)
     }
@@ -237,14 +248,16 @@ export function bootConversations() {
     } else if (e.type === 'conversation.updated') {
       // Surgical patch — apply patch fields to the matching conversation in
       // place without a full network reload.
+      const patchRows = (rows: Conversation[]): Conversation[] => rows.map((c) => {
+        if (c.id !== e.conversationId) return c
+        const next: Conversation = { ...c }
+        if (e.patch.topic !== undefined) next.topic = e.patch.topic
+        if (e.patch.title !== undefined) next.title = e.patch.title
+        return next
+      })
       useConversations.setState((s) => ({
-        list: s.list.map((c) => {
-          if (c.id !== e.conversationId) return c
-          const next: Conversation = { ...c }
-          if (e.patch.topic !== undefined) next.topic = e.patch.topic
-          if (e.patch.title !== undefined) next.title = e.patch.title
-          return next
-        }),
+        list: patchRows(s.list),
+        archived: patchRows(s.archived),
       }))
     }
   })

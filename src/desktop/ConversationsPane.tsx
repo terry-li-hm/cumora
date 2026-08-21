@@ -17,7 +17,7 @@ import { cn } from '@/lib/utils'
 import { api, type ApiProject, type ApiSearchResults } from '@/api/client'
 import type { Conversation, Participant } from '@/types'
 
-const staticFilters = ['All', 'Unread', 'Agents', 'Humans', 'Groups', 'Email', 'Whispers'] as const
+const staticFilters = ['All', 'Unread', 'Agents', 'Humans', 'Groups', 'Email', 'Whispers', 'Archived'] as const
 type StaticFilter = (typeof staticFilters)[number]
 /** A filter is either one of the static labels, or a project chip identified
  *  by `project:<id>`. Keeping it as a string union lets the existing chip
@@ -75,6 +75,8 @@ function muteHint(mutedUntil: string | null | undefined): string {
 }
 
 function matches(c: Conversation, f: Filter, byId: Record<string, { kind: string }>) {
+  if (f === 'Archived') return Boolean(c.archivedAt)
+  if (c.archivedAt) return false
   if (f.startsWith('project:')) {
     const projectId = f.slice('project:'.length)
     return c.projectId === projectId
@@ -596,6 +598,7 @@ export function ConversationsPane({ onResizeStart }: { onResizeStart?: (e: React
   const selected = useApp((s) => s.selectedConversationId)
   const select = useApp((s) => s.selectConversation)
   const list = useConversations((s) => s.list)
+  const archived = useConversations((s) => s.archived)
   const loaded = useConversations((s) => s.loaded)
   const byId = useParticipants((s) => s.byId)
   const [filter, setFilter] = useState<Filter>('All')
@@ -704,6 +707,38 @@ export function ConversationsPane({ onResizeStart }: { onResizeStart?: (e: React
     } catch (err) { console.warn('[mute] failed', err) }
   }
 
+  const setArchived = async (c: Conversation, archive: boolean) => {
+    try {
+      await api.archiveConversation(c.id, archive)
+      const archivedAt = archive ? new Date().toISOString() : null
+      const orderRows = (rows: Conversation[]) => [...rows].sort((a, b) => {
+        const pinDelta = Number(Boolean(b.pinned)) - Number(Boolean(a.pinned))
+        return pinDelta || new Date(b.lastAtIso).getTime() - new Date(a.lastAtIso).getTime()
+      })
+      // The server mutation has succeeded, so reflect it locally before the
+      // reconciliation fetch. reload() is deliberately fail-soft; without this
+      // move a transient fetch failure would leave the successful archive in
+      // the wrong list until the next websocket event or app restart.
+      useConversations.setState((state) => {
+        const source = archive ? state.list : state.archived
+        const found = source.find((row) => row.id === c.id)
+        if (!found) return state
+        const moved = { ...found, archivedAt }
+        return archive
+          ? {
+              list: state.list.filter((row) => row.id !== c.id),
+              archived: orderRows([moved, ...state.archived.filter((row) => row.id !== c.id)]),
+            }
+          : {
+              list: orderRows([moved, ...state.list.filter((row) => row.id !== c.id)]),
+              archived: state.archived.filter((row) => row.id !== c.id),
+            }
+      })
+      if (archive && selected === c.id) select(null)
+      void useConversations.getState().reload()
+    } catch (err) { console.warn('[archive] failed', err) }
+  }
+
   const openContextMenu = (c: Conversation, e: React.MouseEvent) => {
     e.preventDefault()
     e.stopPropagation()
@@ -742,6 +777,11 @@ export function ConversationsPane({ onResizeStart }: { onResizeStart?: (e: React
       hint: muted ? muteHint(c.mutedUntil) : undefined,
       submenu: muteSubmenu,
     })
+    items.push({
+      label: c.archivedAt ? 'Restore conversation' : 'Archive conversation',
+      icon: <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 8v13H3V8"/><path d="M1 3h22v5H1z"/><path d="M10 12h4"/></svg>,
+      onSelect: () => void setArchived(c, !c.archivedAt),
+    })
     if (c.kind === 'group') {
       items.push({
         label: 'Add members…',
@@ -758,7 +798,7 @@ export function ConversationsPane({ onResizeStart }: { onResizeStart?: (e: React
       // Direct chats: actions for the *other* participant.
       const otherId = otherMember(c)
       const other = otherId ? byId[otherId] : undefined
-      if (other) {
+      if (other && !other.departedAt) {
         items.push({
           label: `Create group with ${other.name}…`,
           icon: <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="9" cy="7" r="4"/><path d="M3 21v-2a4 4 0 0 1 4-4h4a4 4 0 0 1 4 4v2"/><line x1="19" y1="8" x2="19" y2="14"/><line x1="22" y1="11" x2="16" y2="11"/></svg>,
@@ -776,8 +816,9 @@ export function ConversationsPane({ onResizeStart }: { onResizeStart?: (e: React
   }
 
   const filtered = useMemo(
-    () => list.filter((c) => c.kind !== 'whisper' && matches(c, filter, byId)),
-    [list, filter, byId],
+    () => (filter === 'Archived' ? archived : list)
+      .filter((c) => c.kind !== 'whisper' && matches(c, filter, byId)),
+    [list, archived, filter, byId],
   )
   // Pinned floats to the top. Everything else (groups, direct chats with
   // agents, direct chats with humans) goes into one flat list — the row
@@ -1062,7 +1103,7 @@ export function ConversationsPane({ onResizeStart }: { onResizeStart?: (e: React
       {addingMembersTo && (
         <AddMembersPicker
           group={addingMembersTo}
-          candidates={Object.values(byId).filter((p) => !addingMembersTo.members.includes(p.id) && p.id !== meId)}
+          candidates={Object.values(byId).filter((p) => !p.departedAt && !addingMembersTo.members.includes(p.id) && p.id !== meId)}
           onClose={() => setAddingMembersTo(null)}
         />
       )}

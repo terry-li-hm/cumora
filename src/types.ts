@@ -76,6 +76,9 @@ export interface Conversation {
   /** for whispers: the two agents in private chat */
   whisperPair?: [string, string]
   pinned?: boolean
+  /** Per-user reversible archive timestamp. Archived conversations are hidden
+   *  from the normal list and search but retain their complete history. */
+  archivedAt?: string | null
   /** Per-user mute. When true, the conversation suppresses notifications and
    *  is excluded from the global unread total (but its per-row badge still
    *  shows). Pair with `mutedUntil` to know when the mute auto-expires. */

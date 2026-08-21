@@ -18,13 +18,19 @@
  * Putting both in one file keeps the CLI and HTTP paths from drifting.
  */
 import { randomUUID } from 'node:crypto'
+import type { PoolClient } from 'pg'
 import { pool } from '../db/pool.js'
 import { CH_MESSAGE_NEW, publish } from '../redis.js'
 
+type Queryable = Pick<PoolClient, 'query'>
+
 /** Atomically claim the next sequence number for a conversation.
  *  Same UPSERT pattern as the human reply path and `cumora reply`. */
-export async function nextConversationSequence(conversationId: string): Promise<number> {
-  const { rows } = await pool.query<{ seq: number }>(
+export async function nextConversationSequence(
+  conversationId: string,
+  db: Queryable = pool,
+): Promise<number> {
+  const { rows } = await db.query<{ seq: number }>(
     `INSERT INTO conversation_counters (conversation_id, next_sequence)
      VALUES ($1, 2)
      ON CONFLICT (conversation_id) DO UPDATE SET next_sequence = conversation_counters.next_sequence + 1
@@ -36,6 +42,70 @@ export async function nextConversationSequence(conversationId: string): Promise<
 
 export type MembershipKind = 'joined' | 'left' | 'kicked'
 
+interface MembershipMessageArgs {
+  conversationId: string
+  companyId: string | null
+  actorId: string
+  kind: MembershipKind
+  participantId: string
+}
+
+export interface PersistedMembershipMessage {
+  messageId: string
+  sequence: number
+  conversationId: string
+  companyId: string | null
+  actorId: string
+  body: string
+}
+
+/** Persist the audit row using the caller's transaction when supplied.
+ * Publishing is separate because Redis must only see rows after commit. */
+export async function insertMembershipSystemMessage(
+  args: MembershipMessageArgs,
+  db: Queryable = pool,
+): Promise<PersistedMembershipMessage> {
+  const messageId = `m-${randomUUID()}`
+  const sequence = await nextConversationSequence(args.conversationId, db)
+  const body = JSON.stringify({
+    kind: args.kind,
+    participantId: args.participantId,
+    actorId: args.actorId,
+  })
+  await db.query(
+    `INSERT INTO messages (id, conversation_id, author_id, kind, body, sequence, company_id)
+     VALUES ($1,$2,$3,'system',$4,$5,$6)`,
+    [messageId, args.conversationId, args.actorId, body, sequence, args.companyId],
+  )
+  return {
+    messageId, sequence, body,
+    conversationId: args.conversationId,
+    companyId: args.companyId,
+    actorId: args.actorId,
+  }
+}
+
+/** Broadcast an already-committed membership row. If Redis is unavailable the
+ * row remains durable and ordinary polling/reload paths still discover it. */
+export async function publishMembershipSystemMessage(
+  message: PersistedMembershipMessage,
+): Promise<void> {
+  await publish(CH_MESSAGE_NEW, {
+    type: 'message.new',
+    conversationId: message.conversationId,
+    companyId: message.companyId ?? undefined,
+    message: {
+      id: message.messageId,
+      conversationId: message.conversationId,
+      authorId: message.actorId,
+      kind: 'system',
+      body: message.body,
+      sequence: message.sequence,
+      at: new Date().toISOString(),
+    },
+  })
+}
+
 /** Insert a membership system row + broadcast it. Order of operations
  *  vs the actual `conversations.members` mutation matters:
  *    - For 'joined': call AFTER members has been updated. The new
@@ -45,34 +115,10 @@ export type MembershipKind = 'joined' | 'left' | 'kicked'
  *      member. The mailbox query filters by current members, so if we
  *      removed them first they'd never see the system row that explains
  *      why their inbox went quiet. */
-export async function postMembershipSystemMessage(args: {
-  conversationId: string
-  companyId: string | null
-  actorId: string
-  kind: MembershipKind
-  participantId: string
-}): Promise<{ messageId: string; sequence: number }> {
-  const messageId = `m-${randomUUID()}`
-  const sequence = await nextConversationSequence(args.conversationId)
-  const body = JSON.stringify({
-    kind: args.kind,
-    participantId: args.participantId,
-    actorId: args.actorId,
-  })
-  await pool.query(
-    `INSERT INTO messages (id, conversation_id, author_id, kind, body, sequence, company_id)
-     VALUES ($1,$2,$3,'system',$4,$5,$6)`,
-    [messageId, args.conversationId, args.actorId, body, sequence, args.companyId],
-  )
-  await publish(CH_MESSAGE_NEW, {
-    type: 'message.new',
-    conversationId: args.conversationId,
-    companyId: args.companyId ?? undefined,
-    message: {
-      id: messageId, conversationId: args.conversationId, authorId: args.actorId,
-      kind: 'system', body, sequence,
-      at: new Date().toISOString(),
-    },
-  })
-  return { messageId, sequence }
+export async function postMembershipSystemMessage(
+  args: MembershipMessageArgs,
+): Promise<{ messageId: string; sequence: number }> {
+  const message = await insertMembershipSystemMessage(args)
+  await publishMembershipSystemMessage(message)
+  return { messageId: message.messageId, sequence: message.sequence }
 }
