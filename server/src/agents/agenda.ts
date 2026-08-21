@@ -433,7 +433,11 @@ Reply as strict JSON.`
       instructions,
       input,
       text: { format: { type: 'json_object' } },
-      max_output_tokens: 300,
+      // DeepSeek V4 Flash regularly spends the first ~300 tokens on hidden
+      // reasoning. A 300-token cap then truncates the JSON to one character,
+      // which made every minute-level BYOA agenda check fail closed. Leave
+      // enough room for reasoning plus the small structured verdict.
+      max_output_tokens: 800,
       reasoning: { effort: 'low' },
     })
     const parsed = JSON.parse(r.output_text ?? '{}') as {
