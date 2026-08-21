@@ -195,13 +195,12 @@ export async function seedIfEmpty(): Promise<void> {
       // per-agent DMs, or #all-hands after an intentionally clean reset.
       await client.query(
         `UPDATE companies
-            SET owner_user_id = $1,
+            SET owner_user_id = NULL,
                 starter_seeded_at = COALESCE(starter_seeded_at, NOW()),
                 starter_dms_seeded_at = COALESCE(starter_dms_seeded_at, NOW()),
                 all_hands_seeded_at = COALESCE(all_hands_seeded_at, NOW()),
                 all_hands_conversation_id = NULL
           WHERE id = 'personal'`,
-        [LOCAL_USER_ID],
       )
     }
 
