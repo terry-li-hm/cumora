@@ -42,6 +42,39 @@ const AGENTS_ROOT = join(CONFIG_DIR, 'agents')
 // `--resume` the SAME engine session — recovering the in-turn context an
 // interrupted long task was building, instead of starting cold.
 const SESSIONS_DIR = join(CONFIG_DIR, 'sessions')
+
+async function secureSessionStore(sessionFile: string): Promise<void> {
+  const dir = dirname(sessionFile)
+  await mkdir(dir, { recursive: true, mode: 0o700 })
+  await chmod(dir, 0o700)
+  try {
+    await chmod(sessionFile, 0o600)
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err
+  }
+}
+
+export async function persistSessionPointer(sessionFile: string, sessionId: string | null): Promise<void> {
+  await secureSessionStore(sessionFile)
+  if (sessionId) {
+    await writeFile(sessionFile, sessionId, { encoding: 'utf8', mode: 0o600 })
+    await chmod(sessionFile, 0o600)
+  } else {
+    await rm(sessionFile, { force: true })
+  }
+}
+
+export async function readSessionPointer(sessionFile: string): Promise<string | null> {
+  await secureSessionStore(sessionFile)
+  try {
+    const sessionId = (await readFile(sessionFile, 'utf8')).trim()
+    return sessionId || null
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return null
+    throw err
+  }
+}
+
 function protectedReadReceiptsPath(): string {
   return process.env.CUMORA_PROTECTED_READ_RECEIPTS
     || join(homedir(), '.local', 'share', 'vivesca', 'cumora-route-receipts.jsonl')
@@ -1162,18 +1195,13 @@ class AgentRunner {
 
   private async persistSessionId(): Promise<void> {
     try {
-      if (this.sessionId) {
-        await mkdir(SESSIONS_DIR, { recursive: true })
-        await writeFile(this.sessionFile, this.sessionId, 'utf8')
-      } else {
-        await rm(this.sessionFile, { force: true })
-      }
+      await persistSessionPointer(this.sessionFile, this.sessionId)
     } catch { /* best-effort — a lost session id just means a cold next wake */ }
   }
 
   private async loadSessionId(): Promise<void> {
     try {
-      const s = (await readFile(this.sessionFile, 'utf8')).trim()
+      const s = await readSessionPointer(this.sessionFile)
       if (s) {
         this.sessionId = s
         console.log(`[computer] ${this.agent.id} restored engine session ${s.slice(0, 8)} from disk — will --resume (continuity across restart)`)
