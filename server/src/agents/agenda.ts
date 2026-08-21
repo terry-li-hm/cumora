@@ -438,7 +438,7 @@ Reply as strict JSON.`
       // which made every minute-level BYOA agenda check fail closed. Leave
       // enough room for reasoning plus the small structured verdict.
       max_output_tokens: 800,
-      reasoning: { effort: 'low' },
+      reasoning: { effort: 'minimal' },
     })
     const parsed = JSON.parse(r.output_text ?? '{}') as {
       actionable?: unknown; focus?: unknown; reason?: unknown
