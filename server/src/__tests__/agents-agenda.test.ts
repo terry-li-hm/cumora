@@ -343,7 +343,7 @@ test('classifyAgendaActionable leaves output headroom beyond reasoning tokens', 
   await classifyAgendaActionable({
     persona: STUB_PERSONA, companyId: 'c1', agenda: SINGLE_CARD_AGENDA,
   })
-  assert.ok(maxOutputTokens >= 600, 'reasoning must not consume the whole structured-output budget')
+  assert.ok(maxOutputTokens >= 2_000, 'live support-model reasoning exceeded 800 tokens before emitting JSON')
 })
 
 test('classifyAgendaActionable: happy path with strict boolean true', async () => {
