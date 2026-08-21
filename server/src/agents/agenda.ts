@@ -463,7 +463,7 @@ Reply as strict JSON.`
       // reasoning. A 300-token cap then truncates the JSON to one character,
       // which made every minute-level BYOA agenda check fail closed. Leave
       // enough room for reasoning plus the small structured verdict.
-      max_output_tokens: 800,
+      max_output_tokens: 2000,
       reasoning: { effort: 'minimal' },
     })
     const parsed = JSON.parse(r.output_text ?? '{}') as {
