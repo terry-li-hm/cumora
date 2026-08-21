@@ -770,6 +770,8 @@ export const api = {
     const qs = params.toString()
     return `${API}/auth/start/${provider}${qs ? `?${qs}` : ''}`
   },
+  authProviders: () =>
+    http<{ google: boolean; github: boolean }>('/auth/providers'),
   authLogout: () =>
     http<{ ok: boolean }>('/auth/logout', { method: 'POST' }),
   /** Permanently delete the signed-in user's account. Soft-deletes

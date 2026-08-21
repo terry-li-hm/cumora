@@ -643,6 +643,16 @@ api.get('/metrics', async (req, res) => {
 
 /* ============== Auth — OAuth only (Google + GitHub) ============== */
 
+/** Which OAuth providers this server actually has credentials for.
+ *  The sign-in screen uses this to hide dead buttons instead of opening
+ *  a browser onto a raw 503 JSON body. */
+api.get('/auth/providers', (_req, res) => {
+  res.json({
+    google: providerEnabled('google'),
+    github: providerEnabled('github'),
+  })
+})
+
 /** 302 to the provider's consent screen. State is opaque to the client —
  *  we mint it server-side, save to Redis (5min TTL), and verify on the
  *  callback to defend against CSRF + cross-provider mixups.

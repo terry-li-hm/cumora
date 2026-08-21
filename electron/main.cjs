@@ -1179,13 +1179,22 @@ function createWindow() {
   })
 
   // If a token arrived on the loopback server BEFORE the window finished
-  // loading (the user was that fast), flush it now.
+  // loading (the user was that fast), flush it now. Otherwise plant the
+  // private local session from ~/.cumora/app-token so a rebuild does not
+  // dump a single-user desktop onto the OAuth screen.
   mainWindow.webContents.once('did-finish-load', () => {
     if (pendingAuthToken) {
       const t = pendingAuthToken
       pendingAuthToken = null
       mainWindow.webContents.send('auth:token', t)
+      return
     }
+    try {
+      const token = fs.readFileSync(path.join(app.getPath('home'), '.cumora', 'app-token'), 'utf8').trim()
+      if (token.length >= 8) {
+        mainWindow.webContents.send('auth:token', { token, companyId: null })
+      }
+    } catch { /* no local token file */ }
   })
 
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {

@@ -29,6 +29,7 @@ export function AuthScreen() {
   const [busy, setBusy] = useState<'google' | 'github' | 'apple' | null>(null)
   const [err, setErr] = useState<string | null>(null)
   const [picker, setPicker] = useState(false)
+  const [providers, setProviders] = useState<{ google: boolean; github: boolean } | null>(null)
 
   // AuthGate strips a successful fragment after consuming it. A failure
   // fragment looks like `#token=&companyId=&error=...` — surface that
@@ -37,6 +38,12 @@ export function AuthScreen() {
     const params = new URLSearchParams(location.hash.replace(/^#/, ''))
     const error = params.get('error')
     if (error) setErr(decodeURIComponent(error))
+  }, [])
+
+  useEffect(() => {
+    void api.authProviders()
+      .then(setProviders)
+      .catch(() => setProviders({ google: true, github: true }))
   }, [])
 
   // Re-arm the sign-in buttons when the user returns to this window after
@@ -87,6 +94,10 @@ export function AuthScreen() {
   }
 
   function go(provider: 'google' | 'github') {
+    if (providers && !providers[provider]) {
+      setErr(`${provider} sign-in is not configured on this server.`)
+      return
+    }
     setBusy(provider); setErr(null)
     if (isElectron && window.cumora?.auth) {
       // Open the user's real browser (Safari / Chrome) so they see the
@@ -198,24 +209,33 @@ export function AuthScreen() {
               {busy === 'apple' ? 'Signing in…' : 'Continue with Apple'}
             </button>
           )}
-          <button
-            type="button"
-            onClick={() => go('google')}
-            disabled={busy !== null}
-            className="h-11 rounded-[10px] border border-ink-200 bg-white hover:bg-cloud transition-colors flex items-center justify-center gap-3 text-[14px] text-ink-800 disabled:opacity-60"
-          >
-            <GoogleMark />
-            {busy === 'google' ? 'Redirecting…' : 'Continue with Google'}
-          </button>
-          <button
-            type="button"
-            onClick={() => go('github')}
-            disabled={busy !== null}
-            className="h-11 rounded-[10px] bg-[#1f2328] hover:bg-[#2a3037] text-white transition-colors flex items-center justify-center gap-3 text-[14px] disabled:opacity-60"
-          >
-            <GitHubMark />
-            {busy === 'github' ? 'Redirecting…' : 'Continue with GitHub'}
-          </button>
+          {(providers?.google ?? true) && (
+            <button
+              type="button"
+              onClick={() => go('google')}
+              disabled={busy !== null}
+              className="h-11 rounded-[10px] border border-ink-200 bg-white hover:bg-cloud transition-colors flex items-center justify-center gap-3 text-[14px] text-ink-800 disabled:opacity-60"
+            >
+              <GoogleMark />
+              {busy === 'google' ? 'Redirecting…' : 'Continue with Google'}
+            </button>
+          )}
+          {(providers?.github ?? true) && (
+            <button
+              type="button"
+              onClick={() => go('github')}
+              disabled={busy !== null}
+              className="h-11 rounded-[10px] bg-[#1f2328] hover:bg-[#2a3037] text-white transition-colors flex items-center justify-center gap-3 text-[14px] disabled:opacity-60"
+            >
+              <GitHubMark />
+              {busy === 'github' ? 'Redirecting…' : 'Continue with GitHub'}
+            </button>
+          )}
+          {providers && !providers.google && !providers.github && (
+            <div className="text-[12px] text-ink-400 text-center">
+              This server has no OAuth providers configured.
+            </div>
+          )}
         </div>
         {err && (
           <div className="text-[12px] text-red-600 text-center max-w-full break-words">
