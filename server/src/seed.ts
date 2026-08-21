@@ -1,14 +1,13 @@
 import { pool } from './db/pool.js'
 
 /**
- * Ensure the placeholder 'yetone' user row exists so FK references from
- * seeded participants / conversations stay valid on a fresh DB. The row
- * has NO password and NO linked OAuth identity, so no one can log in as
- * it — it's purely a referential anchor for the demo data. On first
- * OAuth login, a separate `u-<uuid>` user is created with the real email.
+ * Ensure the configured local user exists so seeded participants and retained
+ * desktop sessions have a stable referential anchor. Public demo installs keep
+ * the historical `yetone` default. Private clean installs should set all three
+ * CUMORA_LOCAL_USER_* values to the actual local owner.
  */
 const CLEAN_LOCAL_SEED = process.env.CUMORA_CLEAN_LOCAL_SEED === '1'
-const LOCAL_USER_ID = 'yetone'
+const LOCAL_USER_ID = process.env.CUMORA_LOCAL_USER_ID?.trim() || 'yetone'
 const LOCAL_USER_NAME = process.env.CUMORA_LOCAL_USER_NAME?.trim() || 'Yetone'
 const LOCAL_USER_EMAIL = process.env.CUMORA_LOCAL_USER_EMAIL?.trim() || 'yetone@dev.local'
 
