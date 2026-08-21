@@ -144,8 +144,8 @@ test('pi seedHome lays out AGENTS.md + .pi/skills and rewrites system-owned pers
   await pi.seedHome(f.home, { id: 'a1', name: 'Iris', role: 'Designer', systemPrompt: null })
   const agentsMd = await readFile(join(f.home, 'AGENTS.md'), 'utf8')
   assert.match(agentsMd, /^# Iris — Designer/)
-  assert.match(agentsMd, /`AGENTS\.md` \(this file\)/, 'the header must name the file pi actually reads')
-  assert.match(agentsMd, /`\.pi\/skills\/` — your skills/)
+  assert.match(agentsMd, /`AGENTS\.md`: these instructions/, 'the header must name the file pi actually reads')
+  assert.match(agentsMd, /`\.pi\/skills\/`: skills/)
   assert.doesNotMatch(agentsMd, /`chromatin\/`/, 'xAI/GLM pi pins do not get Chromatin')
   assert.ok(existsSync(join(f.home, '.pi', 'skills')))
   assert.ok(existsSync(join(f.home, 'memory', 'MEMORY.md')))
@@ -156,7 +156,7 @@ test('pi seedHome lays out AGENTS.md + .pi/skills and rewrites system-owned pers
     model: 'openai-codex/gpt-5.6-sol:high',
   })
   const rewritten = await readFile(join(f.home, 'AGENTS.md'), 'utf8')
-  assert.match(rewritten, /`chromatin\/` — the operator's read-only note vault/)
+  assert.match(rewritten, /`chromatin\/`: task-bound, read-only access/)
   assert.ok(existsSync(join(f.home, 'chromatin')), 'openai-codex pi pin gets the Chromatin symlink')
 })
 

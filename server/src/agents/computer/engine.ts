@@ -19,10 +19,10 @@
  * loop does not depend on the structured output — the agent acts via the
  * `cumora` tool regardless of how we parse stdout.
  */
-import { spawn, execFileSync, type ChildProcess } from 'node:child_process'
+import { type ChildProcess, execFileSync, spawn } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import { mkdir, writeFile, access, mkdtemp, lstat, readlink, symlink, unlink } from 'node:fs/promises'
 import { existsSync, writeFileSync } from 'node:fs'
+import { access, lstat, mkdir, mkdtemp, readlink, symlink, unlink, writeFile } from 'node:fs/promises'
 import { homedir, tmpdir } from 'node:os'
 import { join, delimiter as PATH_DELIMITER } from 'node:path'
 import { StringDecoder } from 'node:string_decoder'
@@ -615,58 +615,33 @@ function extraArgs(envVar: string): string[] {
   return raw ? raw.split(/\s+/).filter(Boolean) : []
 }
 
-const PERSONA_HEADER = (
+export const renderPersonaHeader = (
   p: EnginePersona,
   opts: { personaFile?: string; skillsDir?: string; chromatinAccess?: boolean } = {},
 ): string => {
   const personaFile = opts.personaFile ?? 'CLAUDE.md'
   const skillsDir = opts.skillsDir ?? '.claude/skills/'
   return `# ${p.name}${p.role ? ` — ${p.role}` : ''}\n\n` +
-  `You are **${p.name}**, a member of a team that collaborates in Cumora (a team chat).\n` +
-  (p.systemPrompt?.trim() ? `\n## Your style\n${p.systemPrompt.trim()}\n\n` : '\n') +
-  `This directory is your private home and your working directory — it persists\n` +
-  `across wakes and is yours alone. Its layout:\n` +
-  `- \`${personaFile}\` (this file) — always loaded each wake; keep it short.\n` +
-  `- \`memory/\` — your durable memory. There is NO hidden memory store: to remember\n` +
-  `  something across wakes you MUST write it to a file here (e.g. \`memory/<topic>.md\`)\n` +
-  `  and add a one-line pointer in \`memory/MEMORY.md\`. Saying "I'll remember" without\n` +
-  `  writing a file means you will NOT remember. At the start of each wake, read\n` +
-  `  \`memory/MEMORY.md\` (and the files it points to) to recall what you know.\n` +
-  `- \`notes/\` — scratch notes and drafts.\n` +
-  `- \`${skillsDir}\` — your skills.\n` +
-  `- \`workspace/\` — **put all project files and scratch here**: git clones, builds,\n` +
-  `  downloads, temp files. Always \`cd workspace\` (or use \`workspace/…\` paths) for\n` +
-  `  that work — do NOT clutter your home root with project files.\n` +
+  `You are **${p.name}**, a Cumora teammate. The current room brief supplies your temporary role and output contract.\n` +
+  (p.systemPrompt?.trim() ? `\n## Operating brief\n${p.systemPrompt.trim()}\n\n` : '\n') +
+  `## Workspace and memory\n` +
+  `Your persistent home is this directory. Keep work inside it.\n` +
+  `- \`${personaFile}\`: these instructions, loaded every wake.\n` +
+  `- \`memory/MEMORY.md\`: the index to your only durable memory. Read it each wake. ` +
+  `Write durable facts under \`memory/\` and add a pointer to the index.\n` +
+  `- \`notes/\`: temporary drafts. \`${skillsDir}\`: skills.\n` +
+  `- \`workspace/\`: all project files, downloads, builds, and scratch work.\n` +
   (opts.chromatinAccess
-    ? `- \`chromatin/\` — the operator's read-only note vault. Search and read any material\n` +
-      `  relevant to the current human-directed task without waiting for an exact path.\n` +
-      `  Never edit it; exclude unrelated material, credentials, secrets, and live corporate\n` +
-      `  systems. Do not copy source files into memory or cloud workspaces. Summarize in\n` +
-      `  shared rooms and quote only what the task requires.\n\n`
-    : `\n`) +
-  `## Privacy boundary — STRICT\n` +
-  `You run on a machine that belongs to your operator. Everything OUTSIDE your home\n` +
-  `directory (other projects, \`~/.ssh\`, credentials, browser data, personal files)\n` +
-  `is private and not yours to touch.\n` +
-  `- Stay inside your home directory. Do not read, open, list, or search files\n` +
-  `  outside it unless the operator explicitly asks you to in this Cumora workspace.\n` +
-  `- NEVER paste, quote, summarize, or send the contents — or even the paths — of\n` +
-  `  any file outside your home into Cumora (replies, DMs, docs, kanban). Other\n` +
-  `  people see what you post there.\n` +
-  `- If a task seems to need something outside your home, ask in Cumora first;\n` +
-  `  don't go fetch it on your own.\n\n` +
-  `When you act in Cumora, use the \`cumora\` command-line tool (already on your\n` +
-  `PATH). Key commands:\n` +
-  `- \`cumora inbox\` — unread messages across your conversations\n` +
-  `- \`cumora messages <conversationId> --tail 30\` — read a conversation\n` +
-  `- \`cumora reply <conversationId> '<text>'\` — post a message (SINGLE quotes;\n` +
-  `  for anything with backticks, code, $, quotes, or newlines, write it to a file\n` +
-  `  and use \`cumora reply <conversationId> --file <path>\` so the shell can't mangle it)\n` +
-  `- \`cumora contacts [<query>]\` — your teammates + humans, each with their role/function\n` +
-  `  (search by name or role, e.g. \`cumora contacts designer\`). Use it when someone asks\n` +
-  `  about a person or role you don't already know.\n` +
-  `- \`cumora whoami\` — your identity\n\n` +
-  `Be a real teammate with your own voice — not a generic assistant.\n`
+    ? `- \`chromatin/\`: task-bound, read-only access to the operator's note vault. Search only for ` +
+      `the current human-directed task. Never edit it or retain source files. Exclude unrelated ` +
+      `material, credentials, secrets, and live corporate systems. Share only necessary summaries or quotes.\n`
+    : '') +
+  `\n## Hard boundary\n` +
+  `Everything outside this home is private and out of scope, including other projects, ` +
+  `\`~/.ssh\`, credentials, browser data, and personal files. Do not read, list, open, search, ` +
+  `or expose outside paths or contents unless the operator explicitly requests them for the current ` +
+  `Cumora task. If required access is not available inside this home, ask in Cumora.\n\n` +
+  `Use the \`cumora\` CLI for team actions and \`cumora <command> --help\` for command details.\n`
 }
 
 /** A persistent Claude Code process for ONE agent (see EngineSession). Spawned in
@@ -994,7 +969,7 @@ class ClaudeAdapter implements EngineAdapter {
     // system-owned, not agent-editable, so it's safe to overwrite on every
     // start()/restart (including the restart configMatches() triggers when
     // the operator edits the agent's persona in Cumora).
-    await writeFile(join(home, 'CLAUDE.md'), PERSONA_HEADER(persona, { chromatinAccess }), 'utf8')
+    await writeFile(join(home, 'CLAUDE.md'), renderPersonaHeader(persona, { chromatinAccess }), 'utf8')
     // settings.json lets bash (hence the cumora shim) run without prompts in
     // this isolated home. Only written if absent so the user can customize.
     const settings = join(home, '.claude', 'settings.json')
@@ -1498,7 +1473,7 @@ class CodexAdapter implements EngineAdapter {
     const chromatinAccess = grantsChromatinAccess('codex', persona.model)
     await ensureChromatinLink(home, chromatinAccess)
     // See ClaudeAdapter.seedHome: system-owned, safe to overwrite every start.
-    await writeFile(join(home, 'AGENTS.md'), PERSONA_HEADER(persona, { personaFile: 'AGENTS.md', chromatinAccess }), 'utf8')
+    await writeFile(join(home, 'AGENTS.md'), renderPersonaHeader(persona, { personaFile: 'AGENTS.md', chromatinAccess }), 'utf8')
   }
 
   run(args: EngineRunArgs): Promise<EngineRunResult> {
@@ -1935,7 +1910,7 @@ class GrokAdapter implements EngineAdapter {
     await ensureCommonHome(home)
     const chromatinAccess = grantsChromatinAccess('grok', persona.model)
     await ensureChromatinLink(home, chromatinAccess)
-    await writeFile(join(home, 'AGENTS.md'), PERSONA_HEADER(persona, { personaFile: 'AGENTS.md', chromatinAccess }), 'utf8')
+    await writeFile(join(home, 'AGENTS.md'), renderPersonaHeader(persona, { personaFile: 'AGENTS.md', chromatinAccess }), 'utf8')
   }
 
   run(args: EngineRunArgs): Promise<EngineRunResult> {
@@ -2514,7 +2489,7 @@ class PiAdapter implements EngineAdapter {
     // without requiring a fresh home (matches Claude/Codex adapters).
     await writeFile(
       join(home, 'AGENTS.md'),
-      PERSONA_HEADER(persona, { personaFile: 'AGENTS.md', skillsDir: '.pi/skills/', chromatinAccess }),
+      renderPersonaHeader(persona, { personaFile: 'AGENTS.md', skillsDir: '.pi/skills/', chromatinAccess }),
       'utf8',
     )
   }
@@ -2937,7 +2912,7 @@ class CursorAdapter implements EngineAdapter {
     // home (matches Claude and Codex). Cursor discovers AGENTS.md from its cwd.
     await writeFile(
       join(home, 'AGENTS.md'),
-      PERSONA_HEADER(persona, { personaFile: 'AGENTS.md', skillsDir: '.cursor/skills/', chromatinAccess }),
+      renderPersonaHeader(persona, { personaFile: 'AGENTS.md', skillsDir: '.cursor/skills/', chromatinAccess }),
       'utf8',
     )
   }

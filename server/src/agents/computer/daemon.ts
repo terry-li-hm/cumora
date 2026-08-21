@@ -17,21 +17,22 @@
  *
  * Standalone: only Node builtins + the DB-free SSE parser + engine.ts.
  */
-import { createHash } from 'node:crypto'
-import { mkdir, writeFile, readFile, chmod, rm, stat, copyFile, truncate, appendFile } from 'node:fs/promises'
-import { existsSync } from 'node:fs'
-import { homedir, hostname } from 'node:os'
-import { join, dirname } from 'node:path'
+
 import { execFile, spawn } from 'node:child_process'
+import { createHash } from 'node:crypto'
+import { existsSync } from 'node:fs'
+import { appendFile, chmod, copyFile, mkdir, readFile, rm, stat, truncate, writeFile } from 'node:fs/promises'
+import { homedir, hostname } from 'node:os'
+import { dirname, join } from 'node:path'
 import { promisify } from 'node:util'
 
 const execFileP = promisify(execFile)
-import { parseSseStream, wakeStreamWasStable } from '../runtime/sse-parse.js'
-import { detectEngines, getAdapter, grantsChromatinAccess, ENGINE_IDS, runEngineDoctor, type EngineId, type EngineSession, type EngineRunResult, type EngineUsage, type EngineHopReport } from './engine.js'
-import { usageFromClaude, type TokenUsage } from '../cost.js'
-import { parseTriage, finalizeTriage, isRateLimited } from '../triage-core.js'
+
+import { type TokenUsage, usageFromClaude } from '../cost.js'
 import { GLANCE_YIELD_RULES } from '../glance-protocol.js'
-import { SKYPE_EMOTICONS_GUIDE } from '../skype-emoticons.js'
+import { parseSseStream, wakeStreamWasStable } from '../runtime/sse-parse.js'
+import { finalizeTriage, isRateLimited, parseTriage } from '../triage-core.js'
+import { detectEngines, ENGINE_IDS, type EngineHopReport, type EngineId, type EngineRunResult, type EngineSession, type EngineUsage, getAdapter, grantsChromatinAccess, runEngineDoctor } from './engine.js'
 
 const CONFIG_DIR = join(homedir(), '.cumora')
 const CONFIG_PATH = join(CONFIG_DIR, 'computer.json')
@@ -965,6 +966,23 @@ export function resolveEngineFastModel(
   return override?.trim().toLowerCase() === ENGINE_MODEL_LOCAL ? null : (configured ?? null)
 }
 
+// Cumora coordination mechanics shared by every BYOA engine. Identity, memory,
+// filesystem, disclosure, and workspace rules load natively from the agent's
+// CLAUDE.md/AGENTS.md and must not be duplicated here.
+export function renderComputerStandingPrompt(): string {
+  return (
+    `Act in Cumora through the \`cumora\` CLI on your PATH. Read the relevant thread and respond ` +
+    `from the real posted state. In a group, peers may wake concurrently; post optimistically and ` +
+    `let the server's HELD response settle collisions.\n` +
+    GLANCE_YIELD_RULES + `\n\n` +
+    `For a message containing backticks, code, $, quotes, or multiple lines, write it to ` +
+    `\`notes/reply.md\` and use \`cumora reply <conversationId> --file notes/reply.md\`. ` +
+    `For short plain text, use \`cumora reply <conversationId> 'text'\`. Add ` +
+    `\`--quote <message_id>\` when answering a specific message. Address teammates by ` +
+    `@<id>, not display name. Use \`cumora <command> --help\` for other commands.`
+  )
+}
+
 class AgentRunner {
   /** Aborted once in stop(). Handed to every one-shot `adapter.run(...)` so the
    *  engine child dies with its runner, the way the persistent session already
@@ -1165,6 +1183,10 @@ class AgentRunner {
 
   async start(): Promise<void> {
     await this.adapter.seedHome(this.home, { id: this.agent.id, name: this.agent.name, role: this.agent.role, systemPrompt: this.agent.systemPrompt, model: this.agent.model })
+    // Materialize the system-owned standing prompt at host start, not only when
+    // a persistent engine is first woken. This prevents stale prompt files after
+    // a policy revision and gives one deterministic inspection surface for every engine.
+    await writeFile(join(this.home, '.cumora-standing-prompt.md'), this.standingPrompt(), { mode: 0o600 })
     await writeShim(this.binDir)
     await this.loadSessionId()
     void this.streamLoop()
@@ -1605,47 +1627,7 @@ class AgentRunner {
    *  dynamic bits. No game-specific rules — the engine coordinates in-turn via the
    *  shared glance-yield protocol, exactly like the cloud pod-agent. */
   private standingPrompt(): string {
-    // RESTORED to the 5/28T22:17Z baseline SHAPE: one minimal prompt of essential
-    // mechanics, with GLANCE_YIELD_RULES and a few core sections — NOT a wall of
-    // ── XXX ── sections (that's the bloat the user called out: AGENT_VOICE_RULES
-    // priming, MORE CUMORA COMMANDS, HELD REPLY explainer, CONTEXT COMPACTION,
-    // WORKING A BOARD CARD — none of those existed at 5/28 when coord was perfect,
-    // ergo none of them are required for coord). The agent discovers other CLI
-    // surface via `cumora <cmd> --help` when it needs it.
-    return (
-      `You are a Cumora teammate — a first-class member of this team with your own voice. ` +
-      `You act on Cumora through the \`cumora\` CLI on your PATH.\n\n` +
-      `Read the relevant thread and respond appropriately, in your own voice — like a real teammate. ` +
-      `If a human addressed the whole team, you and every peer likely woke at the same instant, so ` +
-      `coordinate via the protocol below — in short: post the real next item from what's ACTUALLY been posted, ` +
-      `optimistically; the server HOLDs you and shows the newer messages if a peer moved the room while you composed.\n` +
-      // The shared glance-and-yield protocol — verbatim via the const so BYOA
-      // coordinates identically to the cloud pod-agent.
-      GLANCE_YIELD_RULES + `\n\n` +
-      `Posting a message: For ANY message with backticks, code, $, quotes, or multiple lines, ` +
-      `write it to a file (e.g. \`notes/reply.md\`) and post with \`cumora reply <conversationId> --file notes/reply.md\` — ` +
-      `the shell mangles inline \`backtick\` / \`$(...)\` content. For short plain text, ` +
-      `\`cumora reply <conversationId> 'text'\` (SINGLE quotes) is fine. When you're answering a ` +
-      `SPECIFIC message, add \`--quote <message_id>\` so your reply threads to its context. ` +
-      `To address a teammate, @<their-id> (the short id in \`cumora messages\` / \`cumora participants\`), ` +
-      `NOT their display name.\n\n` +
-      // Skype emoticons — shared with the cloud agent so a BYOA agent is as
-      // expressive, not stuck on native emoji only.
-      `${SKYPE_EMOTICONS_GUIDE}\n\n` +
-      `Memory: your only durable store lives under \`memory/\`, indexed by \`memory/MEMORY.md\`. ` +
-      `Consult it before acting. When the operator asks you to remember something (or you learn a ` +
-      `durable fact), WRITE it to a file under \`memory/\` and add a one-line pointer in MEMORY.md — ` +
-      `saying "got it" does NOT persist. Your in-context chat history can be wiped by compaction; ` +
-      `memory files remain. Keep MEMORY.md self-sufficient as a recovery point.\n\n` +
-      `Drive what you own forward — see a task through. Multi-step turns are fine; you do NOT have to ` +
-      `fragment. If someone DMs you mid-task, answer briefly then keep going. The only thing to avoid ` +
-      `is a pointless loop. If progress is waiting on a quiet teammate, follow up (short @<their-id> ` +
-      `"still need X?") and schedule your own check-back: ` +
-      `\`cumora calendar create '<chase>' --at <iso> --assignee ${this.agent.id} --prompt '<what future-you does>'\`. ` +
-      `Stop only when the work is truly done or it's someone else's move.\n\n` +
-      `Privacy: stay inside your home directory. Never read or expose files outside it — this machine ` +
-      `holds the operator's private files.`
-    )
+    return renderComputerStandingPrompt()
   }
 
   /** Per-turn CHAT delta — only the dynamic bits (the invariant HOW lives in the
