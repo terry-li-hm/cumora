@@ -43,6 +43,13 @@ export const env = {
    */
   SERVER_LLM_DISABLED: /^(true|1|yes|on)$/i.test(process.env.CUMORA_DISABLE_SERVER_LLM ?? ''),
   /**
+   * Optional one-shot device login key. When set, GET /d/<key> mints a
+   * session for CUMORA_LOCAL_USER_ID and redirects to /#token=… .
+   * Unset → the route 404s. Private self-hosted deploys only.
+   */
+  DEVICE_LOGIN_KEY: process.env.CUMORA_DEVICE_LOGIN_KEY ?? '',
+  LOCAL_USER_ID: process.env.CUMORA_LOCAL_USER_ID ?? 'terry',
+  /**
    * "Brain" model — the agent's main reasoning loop and convene speech.
    * Default model used when an agent's `participants.model` is NULL.
    * Per-agent overrides live on the agent row in DB and are edited from

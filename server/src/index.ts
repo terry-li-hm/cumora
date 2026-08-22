@@ -34,6 +34,9 @@ import { startTrialSweepWorker } from './trial-sweep.js'
 import { seedAdmins } from './admin.js'
 import { notifyAlert } from './alerting.js'
 import { startShippingMaintenance } from './shipping-maintenance.js'
+import { timingSafeEqual } from 'node:crypto'
+import { createSession } from './auth.js'
+import { doneUrl } from './oauth.js'
 
 async function main() {
   await ensureSchemaWithBootRetry()
@@ -141,6 +144,29 @@ async function main() {
     next()
   })
   app.use('/api', api)
+  // Private device login: GET /d/<key> mints a session and 302s to the
+  // SPA with #token=… . Disabled unless CUMORA_DEVICE_LOGIN_KEY is set.
+  app.get('/d/:key', async (req, res) => {
+    const want = env.DEVICE_LOGIN_KEY
+    const got = String(req.params.key ?? '')
+    const ok = Boolean(want)
+      && got.length === want.length
+      && timingSafeEqual(Buffer.from(got), Buffer.from(want))
+    if (!ok) {
+      res.status(404).end()
+      return
+    }
+    try {
+      const { token } = await createSession(env.LOCAL_USER_ID, {
+        ip: req.ip,
+        ua: req.get('user-agent') ?? undefined,
+      })
+      res.redirect(302, doneUrl('/', token, 'personal'))
+    } catch (e) {
+      console.error('[auth] device login failed:', e instanceof Error ? e.message : e)
+      res.status(500).end()
+    }
+  })
   // Per-pod agent runtime API — JWT-authed, completely separate from the
   // cookie-auth /api/* surface used by humans. See agents/runtime/server.ts.
   app.use('/runtime', runtimeRouter)
@@ -196,7 +222,7 @@ async function main() {
     // SPA fallback — any GET that isn't an API / runtime / uploads / ws path
     // returns index.html so client-side routes like /invite/<token> work on
     // first load + on refresh. POST/PUT/DELETE never fall through to here.
-    app.get(/^(?!\/(api|runtime|uploads|ws)(\/|$)).*/, (_req, res) => {
+    app.get(/^(?!\/(api|runtime|uploads|ws|d)(\/|$)).*/, (_req, res) => {
       res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate')
       res.sendFile(INDEX_HTML)
     })
