@@ -5,38 +5,15 @@ import type {
   CalendarReminderChannel,ComputerStatus, ComputerKind, EngineId,
 } from '@/types'
 import { getAuthToken, getActiveCompanyId, useAuth } from '@/stores/auth'
+import { resolveServerOrigin, SERVER_URL_KEY } from '@/lib/server-origin'
 
 const DEVTOOLS_KEY = 'cumora.devtools.enabled'
-const SERVER_URL_KEY = 'cumora.serverUrl'
 
 // Vite's relative proxy keeps browser requests same-origin, but the pairing
 // command runs outside the browser and must address the API directly.
 const DEV_API_TARGET = import.meta.env.DEV
   ? (import.meta.env.VITE_CUMORA_DEV_API_TARGET as string | undefined)?.replace(/\/+$/, '')
   : undefined
-
-/** Resolve the API base. Three layers, highest priority first:
- *    1. localStorage['cumora.serverUrl'] — runtime override, settable
- *       from the dev console: `localStorage.setItem('cumora.serverUrl',
- *       'https://api.cumora.ai')`. Lets a packaged build switch between
- *       prod and a custom endpoint without rebuilding.
- *    2. import.meta.env.VITE_CUMORA_API_BASE — baked at build time,
- *       e.g. .env.production points it at https://api.cumora.ai.
- *    3. '' — falls back to relative URLs, which work in Vite dev (the
- *       proxy rewrites /api → CUMORA_DEV_API_TARGET) and in any same-
- *       origin static deploy.
- *  Values should be the origin only, with NO trailing slash and NO
- *  `/api` suffix — the suffix is added on use, so `http(...)` and the
- *  WS / ws-ticket paths stay consistent. */
-function resolveServerOrigin(): string {
-  if (typeof localStorage !== 'undefined') {
-    const override = localStorage.getItem(SERVER_URL_KEY)
-    if (override) return override.replace(/\/+$/, '')
-  }
-  const baked = import.meta.env.VITE_CUMORA_API_BASE as string | undefined
-  if (baked) return baked.replace(/\/+$/, '')
-  return ''
-}
 
 const SERVER_ORIGIN = resolveServerOrigin()
 const API = `${SERVER_ORIGIN}/api`

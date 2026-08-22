@@ -9,15 +9,10 @@
  * is what authenticates admin calls.
  */
 import { getAuthToken, useAuth } from '@/stores/auth'
+import { resolveServerOrigin } from '@/lib/server-origin'
 
 function origin(): string {
-  if (typeof localStorage !== 'undefined') {
-    const override = localStorage.getItem('cumora.serverUrl')
-    if (override) return override.replace(/\/+$/, '')
-  }
-  const baked = import.meta.env.VITE_CUMORA_API_BASE as string | undefined
-  if (baked) return baked.replace(/\/+$/, '')
-  return ''
+  return resolveServerOrigin()
 }
 
 async function http<T>(path: string, init?: RequestInit): Promise<T> {
