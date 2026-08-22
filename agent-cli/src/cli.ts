@@ -19,10 +19,15 @@ async function main(): Promise<void> {
   process.stderr.write(
     'cumora — run your Cumora agents on this machine (BYOA)\n\n' +
     'Usage:\n' +
-    '  npx cumora@latest agent computer --pair <code> [--server <url>]   pair this machine\n' +
-    '  npx cumora@latest agent computer [--server <url>]                 start the daemon\n\n' +
-    'Needs `claude` (Claude Code), `codex`, `grok` (Grok Build), `pi`, or `cursor-agent` (Cursor) on PATH. Get a pairing code from\n' +
-    'Cumora → You → Computers → Add a computer.\n',
+    '  npx cumora@latest agent computer --pair <code> [--server <url>]      pair this machine\n' +
+    '  npx cumora@latest agent computer [--server <url>]                    start the daemon\n' +
+    '  npx cumora@latest agent computer --doctor                            check local engines\n' +
+    '  npx cumora@latest agent computer --install-service [--server <url>]  install background service\n' +
+    '  npx cumora@latest agent computer --status | --logs | --restart       operate the service\n\n' +
+    'Needs `claude` (Claude Code), `codex`, `grok` (Grok Build), `pi`, or `cursor-agent` (Cursor) on PATH.\n' +
+    'Pairing code: Cumora → You → Computers → Add a computer. Config: ~/.cumora/computer.json\n' +
+    'Recovery: restart the foreground daemon or installed service; re-pair if the computer was removed.\n' +
+    'Full options: npx cumora@latest agent computer --help\n',
   )
   process.exit(argv.length ? 1 : 0)
 }
