@@ -286,6 +286,17 @@ async function wakeOne(
     console.warn(`[scheduler] ${agentId} ${reason} wake dropped: budget ${LOW_PRIORITY_WAKE_BUDGET_PER_MIN}/min exceeded`)
     return
   }
+  // Fail closed before publishing: a managed pod that was already attached
+  // when the server started would otherwise still receive wakes and call its
+  // provider even though new pod creation and in-process clients are blocked.
+  // BYOA daemons remain eligible because their provider traffic is local.
+  if (env.SERVER_LLM_DISABLED) {
+    const host = await resolveAgentHost(agentId).catch(() => ({ kind: null, companyId: null }))
+    if (!isByoaKind(host.kind)) {
+      console.log(`[scheduler] ${agentId} managed wake deferred: server-side LLM calls are disabled`)
+      return
+    }
+  }
   const wakePayload = {
     kind: 'wake' as const,
     reason,

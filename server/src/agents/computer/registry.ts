@@ -339,6 +339,7 @@ export async function mintAgentRuntimeToken(args: {
   const token = signAgentToken({
     agentId: args.agentId,
     companyId: rows[0].company_id,
+    runtimeKind: 'byoa',
     ttlSeconds: AGENT_TOKEN_TTL_SECONDS,
   })
   return { token, expiresInSeconds: AGENT_TOKEN_TTL_SECONDS }

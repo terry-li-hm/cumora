@@ -653,6 +653,16 @@ const ENSURE_POD_WATCHDOG_MS = 180_000
  *  is free to enqueue the wake event on the bus; the Pod, once it
  *  connects, drains its inbox unconditionally and catches up. */
 export async function ensurePod(agentId: string): Promise<EnsurePodResult> {
+  // Managed pods receive a provider key and originate model traffic outside
+  // the server process, so the BYOA-only egress switch must stop them at the
+  // orchestration boundary as well as blocking getLlmClient().
+  if (env.SERVER_LLM_DISABLED) {
+    return {
+      created: false,
+      ok: false,
+      reason: 'managed agent pods are disabled by CUMORA_DISABLE_SERVER_LLM',
+    }
+  }
   const existing = inFlight.get(agentId)
   if (existing) return existing
   const p = (async (): Promise<EnsurePodResult> => {
@@ -779,6 +789,7 @@ async function ensurePodImpl(agentId: string): Promise<EnsurePodResult> {
   const token = signAgentToken({
     agentId,
     companyId: persona.companyId,
+    runtimeKind: 'managed',
     ttlSeconds: TOKEN_TTL_SECONDS,
   })
 

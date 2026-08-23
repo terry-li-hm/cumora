@@ -1,9 +1,10 @@
 /**
  * Minimal HS256 JWT for runtime-pod ↔ server auth.
  *
- * Server signs one token per spawned pod with `{ sub: agentId,
- * companyId, scope: 'agent-runner', iat, exp }`. Pod presents it on
- * every `/runtime/*` request. Server verifies sig + exp + scope and
+ * Server signs one token per runtime with `{ sub: agentId, companyId,
+ * runtimeKind, scope: 'agent-runner', iat, exp }`. The immutable runtimeKind
+ * distinguishes managed pods from BYOA daemons even after reassignment. The
+ * runtime presents the token on every `/runtime/*` request. Server verifies sig + exp + scope and
  * pins the agentId to the token — endpoints never trust an agentId
  * from the request body.
  *
@@ -20,6 +21,8 @@ export interface AgentRuntimeClaims {
   sub: string
   /** company id the agent belongs to. Pinned so requests can't cross tenants. */
   companyId: string | null
+  /** Immutable origin of this runtime credential. */
+  runtimeKind: 'managed' | 'byoa'
   /** Fixed string; lets the server reject tokens minted for other purposes. */
   scope: 'agent-runner'
   /** issued-at, unix seconds. */
@@ -45,16 +48,20 @@ function sign(headerB64: string, payloadB64: string): string {
   return b64url(mac.digest())
 }
 
-/** Mint a token for a freshly-spawned agent pod. */
+/** Mint a token for a managed pod or paired BYOA daemon. */
 export function signAgentToken(args: {
   agentId: string
   companyId: string | null
+  runtimeKind?: 'managed' | 'byoa'
   ttlSeconds?: number
 }): string {
   const now = Math.floor(Date.now() / 1000)
   const claims: AgentRuntimeClaims = {
     sub: args.agentId,
     companyId: args.companyId,
+    // Omission is fail-closed: only the BYOA device-token mint path may opt
+    // into the less-restricted origin. Tests and managed probes stay managed.
+    runtimeKind: args.runtimeKind ?? 'managed',
     scope: 'agent-runner',
     iat: now,
     exp: now + (args.ttlSeconds ?? DEFAULT_TTL_SECONDS),
@@ -76,8 +83,16 @@ export function verifyAgentToken(token: string): AgentRuntimeClaims {
   if (a.length !== b.length || !timingSafeEqual(a, b)) throw new Error('bad signature')
   const claims = JSON.parse(fromB64url(payloadB64).toString('utf8')) as AgentRuntimeClaims
   if (claims.scope !== 'agent-runner') throw new Error('bad scope')
+  if (claims.runtimeKind !== 'managed' && claims.runtimeKind !== 'byoa') throw new Error('missing runtime kind')
   const now = Math.floor(Date.now() / 1000)
   if (typeof claims.exp !== 'number' || claims.exp < now) throw new Error('token expired')
   if (typeof claims.sub !== 'string' || !claims.sub) throw new Error('missing sub')
   return claims
+}
+
+/** BYOA-only deployments accept only credentials minted by a paired daemon.
+ * This must use the immutable token claim, never the agent's current computer
+ * assignment: a managed pod can retain its token after reassignment. */
+export function runtimeAllowedWhenServerLlmDisabled(claims: AgentRuntimeClaims): boolean {
+  return claims.runtimeKind === 'byoa'
 }

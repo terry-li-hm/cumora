@@ -25,8 +25,9 @@ import { touchAgentRun, recordTriage, type TriageSource } from '../observability
 import { buildRuntimeArgv } from './cli-argv.js'
 import { attachFsEndpoints } from './fs-endpoints.js'
 import { inprocClient } from './inproc-client.js'
-import { verifyAgentToken, type AgentRuntimeClaims } from './jwt.js'
+import { runtimeAllowedWhenServerLlmDisabled, verifyAgentToken, type AgentRuntimeClaims } from './jwt.js'
 import { attachWakeStream, } from './wake-bus.js'
+import { env } from '../../env.js'
 
 export type { WakeEvent } from './wake-bus.js'
 
@@ -41,7 +42,12 @@ function authMiddleware(req: RuntimeRequest, res: Response, next: NextFunction):
     return
   }
   try {
-    req.agent = verifyAgentToken(header.slice('Bearer '.length).trim())
+    const claims = verifyAgentToken(header.slice('Bearer '.length).trim())
+    if (env.SERVER_LLM_DISABLED && !runtimeAllowedWhenServerLlmDisabled(claims)) {
+      res.status(503).json({ error: 'managed agent runtime is disabled' })
+      return
+    }
+    req.agent = claims
     next()
   } catch (err) {
     res.status(401).json({ error: err instanceof Error ? err.message : 'invalid token' })

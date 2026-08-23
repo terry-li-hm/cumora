@@ -2277,6 +2277,13 @@ class AgentRunner {
         const res = await fetch(`${this.cfg.serverUrl}/runtime/wake-stream`, {
           headers: { Authorization: `Bearer ${token}`, Accept: 'text/event-stream' },
         })
+        if (res.status === 401 || res.status === 403) {
+          // A server upgrade can intentionally invalidate legacy runtime tokens
+          // that lack immutable origin claims. Remint immediately rather than
+          // retrying the rejected token until its normal two-hour expiry.
+          this.token = ''
+          this.tokenExpiresAt = 0
+        }
         if (!res.ok || !res.body) throw new Error(`wake-stream HTTP ${res.status}`)
         console.log(`[computer] ${this.agent.id} wake-stream connected (engine: ${this.adapter.id})`)
         connectedAt = Date.now()

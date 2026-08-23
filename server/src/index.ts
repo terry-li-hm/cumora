@@ -138,7 +138,10 @@ async function main() {
     res.on('finish', () => {
       const ms = Date.now() - t
       if (ms > 250 || res.statusCode >= 400) {
-        console.log(`[http] ${req.method} ${req.url} → ${res.statusCode} ${ms}ms`)
+        // /d/:key carries a reusable login credential in the path. Never put
+        // it in logs, including on the failure/slow paths logged here.
+        const target = req.path.startsWith('/d/') ? '/d/<redacted>' : req.url
+        console.log(`[http] ${req.method} ${target} → ${res.statusCode} ${ms}ms`)
       }
     })
     next()
@@ -147,11 +150,11 @@ async function main() {
   // Private device login: GET /d/<key> mints a session and 302s to the
   // SPA with #token=… . Disabled unless CUMORA_DEVICE_LOGIN_KEY is set.
   app.get('/d/:key', async (req, res) => {
-    const want = env.DEVICE_LOGIN_KEY
-    const got = String(req.params.key ?? '')
-    const ok = Boolean(want)
+    const want = Buffer.from(env.DEVICE_LOGIN_KEY)
+    const got = Buffer.from(String(req.params.key ?? ''))
+    const ok = want.length > 0
       && got.length === want.length
-      && timingSafeEqual(Buffer.from(got), Buffer.from(want))
+      && timingSafeEqual(got, want)
     if (!ok) {
       res.status(404).end()
       return
@@ -161,6 +164,9 @@ async function main() {
         ip: req.ip,
         ua: req.get('user-agent') ?? undefined,
       })
+      // The Location header carries a fresh bearer token. Do not let a browser
+      // or intermediary cache and replay this credential-bearing redirect.
+      res.setHeader('Cache-Control', 'no-store')
       res.redirect(302, doneUrl('/', token, 'personal'))
     } catch (e) {
       console.error('[auth] device login failed:', e instanceof Error ? e.message : e)

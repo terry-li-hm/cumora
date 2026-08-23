@@ -13,7 +13,7 @@
  *
  *   - `HttpRuntimeClient` — fetches over HTTP to the server's
  *     `/cli/*` endpoints, authenticated by a per-pod JWT scoped to
- *     `{ agentId, companyId, scope: 'agent-runner' }`. To be built.
+ *     `{ agentId, companyId, runtimeKind, scope: 'agent-runner' }`. To be built.
  *     This is what ships inside the container image.
  *
  * Interface design notes:

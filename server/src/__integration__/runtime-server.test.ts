@@ -126,7 +126,7 @@ test('[integration] runtime: malformed token (not three segments) → 401', asyn
 test('[integration] runtime: expired token → 401', async () => {
   const { agentId, companyId } = await seedAgent()
   // ttlSeconds = -1 → exp = now - 1s, definitely expired.
-  const tok = signAgentToken({ agentId, companyId, ttlSeconds: -1 })
+  const tok = signAgentToken({ agentId, companyId, runtimeKind: 'managed', ttlSeconds: -1 })
   const r = await call('/runtime/inbox', { method: 'GET', token: tok })
   assert.equal(r.status, 401)
   assert.match(String(r.body?.error ?? ''), /expired/i)

@@ -339,7 +339,9 @@ not the user's session. "Remove Computer" is a real kill switch.
 4. daemon: GET /api/computers/me/agents (roster, re-polled every 60s);
    per agent it mints a short-lived runtime JWT (2h TTL, refreshed before
    expiry) via POST /api/agents/:id/runtime-token — used for that agent's
-   wake-stream SSE and the cumora shim.
+   wake-stream SSE and the cumora shim. The signed token carries immutable
+   `runtimeKind='byoa'`; managed-pod tokens carry `runtimeKind='managed'`, so
+   reassignment cannot make a stale managed credential masquerade as BYOA.
 5. heartbeat: POST /api/computers/heartbeat every 30s; a computer with no
    heartbeat for 90s shows offline and its agents show sleeping.
 6. UI "Remove" ─► sets revoked_at; the device token and all derived agent

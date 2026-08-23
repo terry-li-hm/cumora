@@ -43,12 +43,15 @@ export const env = {
    */
   SERVER_LLM_DISABLED: /^(true|1|yes|on)$/i.test(process.env.CUMORA_DISABLE_SERVER_LLM ?? ''),
   /**
-   * Optional one-shot device login key. When set, GET /d/<key> mints a
-   * session for CUMORA_LOCAL_USER_ID and redirects to /#token=… .
-   * Unset → the route 404s. Private self-hosted deploys only.
+   * Optional device login key. When set, GET /d/<key> mints a session
+   * for CUMORA_LOCAL_USER_ID and redirects to /#token=… . Unset → the
+   * route 404s. This is a reusable credential for private self-hosted
+   * deployments, not a single-use token.
    */
   DEVICE_LOGIN_KEY: process.env.CUMORA_DEVICE_LOGIN_KEY ?? '',
-  LOCAL_USER_ID: process.env.CUMORA_LOCAL_USER_ID ?? 'terry',
+  // Keep this fallback aligned with seed.ts so enabling device login on a
+  // default local database cannot try to mint a session for a missing user.
+  LOCAL_USER_ID: process.env.CUMORA_LOCAL_USER_ID?.trim() || 'yetone',
   /**
    * "Brain" model — the agent's main reasoning loop and convene speech.
    * Default model used when an agent's `participants.model` is NULL.
@@ -170,7 +173,8 @@ export const env = {
    * HMAC secret used to sign per-agent JWTs handed to runtime pods.
    * The server signs at pod-spawn time; the pod presents the token on
    * every `/runtime/*` request. Token shape:
-   *   { sub: agentId, companyId, scope: 'agent-runner', iat, exp }
+   *   { sub: agentId, companyId, runtimeKind: 'managed'|'byoa',
+   *     scope: 'agent-runner', iat, exp }
    *
    * Dev default = deterministic-but-random-looking string so single-
    * machine dev "just works". In prod set a real high-entropy secret —
