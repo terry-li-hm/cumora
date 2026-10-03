@@ -15,7 +15,11 @@ import { mkdtemp, mkdir, writeFile, readFile, chmod, rm } from 'node:fs/promises
 import { existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { setTimeout as delay } from 'node:timers/promises'
+import childProcess from 'node:child_process'
+import { syncBuiltinESMExports } from 'node:module'
+import { EventEmitter } from 'node:events'
+import { PassThrough, Writable } from 'node:stream'
+import { setImmediate as nextImmediate, setTimeout as delay } from 'node:timers/promises'
 import { afterEach, test } from 'node:test'
 import assert from 'node:assert/strict'
 import { getAdapter, grantsChromatinAccess, type EngineHopReport } from '../agents/computer/engine.js'
@@ -314,6 +318,47 @@ test('pi classify(): a turn-level model error is an error even though the proces
   const f = await fixture('turn-error')
   const res = await getAdapter('pi').classify({ cwd: f.home, prompt: 'x', env: f.env, signal: new AbortController().signal })
   assert.match(res.error ?? '', /rate limit exceeded/)
+})
+
+test('pi probeWake() owns asynchronous stdin EPIPE through child close and late errors', { skip: IS_WIN }, async (t) => {
+  const writes: string[] = []
+  const epipe = Object.assign(new Error('write EPIPE'), { code: 'EPIPE' })
+  const stdin = new Writable({
+    write(chunk, _encoding, callback) {
+      writes.push(chunk.toString())
+      // Fail after write() has returned, as a closed pipe does on Linux.
+      queueMicrotask(() => callback(epipe))
+    },
+  })
+  const stdout = new PassThrough()
+  const stderr = new PassThrough()
+  const child = Object.assign(new EventEmitter(), { stdin, stdout, stderr, kill: () => true })
+  const spawnMock = t.mock.method(childProcess, 'spawn', () => child)
+  syncBuiltinESMExports()
+  try {
+    let settled = false
+    const pending = getAdapter('pi').probeWake({
+      cwd: '.', env: {}, signal: new AbortController().signal,
+    }).then((result) => { settled = true; return result })
+    await nextImmediate()
+    assert.equal(spawnMock.mock.callCount(), 1)
+    assert.deepEqual(writes, ['{"id":"doctor","type":"get_state"}\n'])
+    assert.equal(stdin.errored, epipe, 'the Writable emitted an asynchronous error')
+    assert.equal(settled, false, 'stdin error must leave diagnosis to child close')
+    stderr.write('fatal: rpc mode unavailable\n')
+    child.emit('close', 2, null)
+    const result = await pending
+    assert.equal(result.ok, false)
+    assert.match(result.detail, /rpc process died before answering get_state \(exit 2\): .*fatal: rpc mode unavailable/)
+    // Ownership must survive settlement; a once-listener is insufficient.
+    await Promise.resolve().then(() => stdin.emit('error', epipe))
+  } finally {
+    spawnMock.mock.restore()
+    syncBuiltinESMExports()
+    stdin.destroy()
+    stdout.destroy()
+    stderr.destroy()
+  }
 })
 
 test('pi probeWake() round-trips get_state over rpc; skipped under a CUMORA_PI_ARGS override', { skip: IS_WIN }, async () => {

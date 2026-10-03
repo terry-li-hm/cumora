@@ -1,11 +1,22 @@
-import { afterEach, after, test } from 'node:test'
+import { beforeEach, afterEach, after, test } from 'node:test'
 import assert from 'node:assert/strict'
 import { classifyInboxTriage } from '../agents/inbox-triage.js'
 import type { ContextRow, InboxRow, PersonaRow } from '../agents/runtime/client.js'
 import { __setLlmClientOverrideForTesting } from '../llm.js'
 import { redis, sub } from '../redis.js'
+import { inprocClient } from '../agents/runtime/inproc-client.js'
+
+const originalPeekWorklog = inprocClient.peekWorklog
+const originalHumanRecentlyActive = inprocClient.humanRecentlyActive
+
+beforeEach(() => {
+  inprocClient.peekWorklog = async () => []
+  inprocClient.humanRecentlyActive = async () => false
+})
 
 afterEach(() => {
+  inprocClient.peekWorklog = originalPeekWorklog
+  inprocClient.humanRecentlyActive = originalHumanRecentlyActive
   __setLlmClientOverrideForTesting(null)
 })
 
@@ -68,6 +79,41 @@ function stubLlm(outputText: string): void {
     },
   })) as unknown as Parameters<typeof __setLlmClientOverrideForTesting>[0])
 }
+
+test('human triage uses conversation/company seams without real services or a model', async () => {
+  const conversationId = 'triage-regression-conversation'
+  const companyId = 'triage-regression-company'
+  const scopes: string[] = []
+  const companies: string[] = []
+  let modelClientCalls = 0
+  inprocClient.peekWorklog = async (scopeKey: string) => {
+    scopes.push(scopeKey)
+    return []
+  }
+  inprocClient.humanRecentlyActive = async (id: string) => {
+    companies.push(id)
+    return false
+  }
+  __setLlmClientOverrideForTesting((async () => {
+    modelClientCalls += 1
+    throw new Error('Human triage must not request a model client')
+  }) as unknown as Parameters<typeof __setLlmClientOverrideForTesting>[0])
+
+  const message = inboxRow({ conversation_id: conversationId, company_id: companyId })
+  const verdict = await classifyInboxTriage({
+    agentId: PERSONA.id,
+    companyId,
+    persona: { ...PERSONA, companyId },
+    inbox: [message],
+    context: [contextRow(message)],
+  })
+
+  assert.deepEqual(scopes, [conversationId])
+  assert.deepEqual(companies, [companyId])
+  assert.equal(modelClientCalls, 0)
+  assert.equal(verdict.actionable, true)
+  assert.equal(verdict.source, 'human-group')
+})
 
 // Capture the exact params passed to responses.create, to assert request shape.
 function captureLlm(): { params: () => Record<string, unknown> | null } {

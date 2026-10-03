@@ -2444,6 +2444,10 @@ class PiAdapter implements EngineAdapter {
       const child = spawn(command, ['--mode', 'rpc', ...PiAdapter.BARE], {
         cwd: args.cwd, env: args.env, stdio: ['pipe', 'pipe', 'pipe'], shell,
       })
+      // stdin errors are not child errors: an early exit can emit EPIPE after
+      // write() returns. Let the child lifecycle report stderr/exit diagnostics,
+      // and keep ownership of stream errors even after finish() closes stdin.
+      child.stdin?.on('error', () => { /* child error/close or abort reports */ })
       const onAbort = (): void => finish({ ok: false, detail: 'aborted (timeout)' })
       if (args.signal.aborted) { onAbort(); return }
       args.signal.addEventListener('abort', onAbort, { once: true })
