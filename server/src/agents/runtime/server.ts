@@ -25,9 +25,10 @@ import { touchAgentRun, recordTriage, type TriageSource } from '../observability
 import { buildRuntimeArgv } from './cli-argv.js'
 import { attachFsEndpoints } from './fs-endpoints.js'
 import { inprocClient } from './inproc-client.js'
-import { runtimeAllowedWhenServerLlmDisabled, verifyAgentToken, type AgentRuntimeClaims } from './jwt.js'
-import { attachWakeStream, } from './wake-bus.js'
+import { runtimeAllowedWhenServerLlmDisabled, runtimeCredentialMatchesAssignment, verifyAgentToken, type AgentRuntimeAssignment, type AgentRuntimeClaims } from './jwt.js'
+import { attachWakeStream, type WakeStreamAuth } from './wake-bus.js'
 import { env } from '../../env.js'
+import { pool } from '../../db/pool.js'
 
 export type { WakeEvent } from './wake-bus.js'
 
@@ -35,7 +36,72 @@ interface RuntimeRequest extends Request {
   agent?: AgentRuntimeClaims
 }
 
-function authMiddleware(req: RuntimeRequest, res: Response, next: NextFunction): void {
+let runtimeAssignmentOverrideForTesting: ((claims: AgentRuntimeClaims) => boolean | Promise<boolean>) | null = null
+export function __setRuntimeAssignmentOverrideForTesting(
+  fn: typeof runtimeAssignmentOverrideForTesting,
+): void {
+  runtimeAssignmentOverrideForTesting = fn
+}
+
+async function runtimeAssignmentIsCurrent(claims: AgentRuntimeClaims): Promise<boolean> {
+  try {
+    if (runtimeAssignmentOverrideForTesting) return await runtimeAssignmentOverrideForTesting(claims)
+    const { rows } = await pool.query<{
+      computerId: string | null
+      computerKind: AgentRuntimeAssignment['computerKind']
+      engine: string | null
+      assignmentVersion: string | null
+      revokedAt: string | null
+    }>(
+      `SELECT p.computer_id AS "computerId", p.engine,
+              p.assignment_version AS "assignmentVersion",
+              c.kind AS "computerKind", c.revoked_at AS "revokedAt"
+         FROM participants p
+         LEFT JOIN computers c
+           ON c.id = p.computer_id
+          AND c.company_id = p.company_id
+        WHERE p.id = $1 AND p.kind = 'agent'
+          AND p.company_id IS NOT DISTINCT FROM $2
+          AND p.departed_at IS NULL
+        LIMIT 1`,
+      [claims.sub, claims.companyId],
+    )
+    const row = rows[0]
+    return runtimeCredentialMatchesAssignment(claims, row ? {
+      computerId: row.computerId,
+      computerKind: row.computerKind,
+      engine: row.engine,
+      assignmentVersion: row.assignmentVersion,
+      computerRevoked: row.revokedAt !== null,
+    } : null)
+  } catch (err) {
+    // Assignment lookup is part of authentication. Fail closed rather than
+    // letting a database hiccup revive a moved/revoked runtime credential.
+    console.warn('[runtime] assignment authentication failed', err instanceof Error ? err.message : err)
+    return false
+  }
+}
+
+/** The wake-stream revalidation closure for a set of verified claims: the
+ *  stream stays eligible only while the credential is unexpired AND still
+ *  bound to the agent's current assignment (company, host, opaque persisted
+ *  assignment version, no revocation/departure). Applied before EVERY event
+ *  written to the stream, not just at connection time. Expiry is checked
+ *  BOTH before and AFTER the awaited assignment lookup — a slow DB read can
+ *  straddle the expiry instant, and the write must fail closed in that case
+ *  (the wake-bus additionally re-checks at the write boundary). */
+export function wakeStreamAuthForClaims(claims: AgentRuntimeClaims): WakeStreamAuth {
+  return {
+    expiresAtMs: claims.exp * 1000,
+    revalidate: async () => {
+      if (claims.exp * 1000 <= Date.now()) return false
+      if (!(await runtimeAssignmentIsCurrent(claims))) return false
+      return claims.exp * 1000 > Date.now()
+    },
+  }
+}
+
+async function authMiddleware(req: RuntimeRequest, res: Response, next: NextFunction): Promise<void> {
   const header = req.headers['authorization']
   if (!header || typeof header !== 'string' || !header.startsWith('Bearer ')) {
     res.status(401).json({ error: 'missing bearer token' })
@@ -45,6 +111,10 @@ function authMiddleware(req: RuntimeRequest, res: Response, next: NextFunction):
     const claims = verifyAgentToken(header.slice('Bearer '.length).trim())
     if (env.SERVER_LLM_DISABLED && !runtimeAllowedWhenServerLlmDisabled(claims)) {
       res.status(503).json({ error: 'managed agent runtime is disabled' })
+      return
+    }
+    if (!(await runtimeAssignmentIsCurrent(claims))) {
+      res.status(401).json({ error: 'runtime credential is no longer assigned' })
       return
     }
     req.agent = claims
@@ -76,7 +146,7 @@ runtimeRouter.use(authMiddleware as never)
 // ─── wake stream: server pushes events to the agent's long-running pod ─
 
 runtimeRouter.get('/wake-stream', withAgent(async (c, _req, res) => {
-  await attachWakeStream(c.sub, res)
+  await attachWakeStream(c.sub, res, wakeStreamAuthForClaims(c))
   // Don't end — attachWakeStream keeps the response open until the
   // client disconnects.
 }))

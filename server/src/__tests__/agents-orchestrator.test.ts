@@ -18,9 +18,14 @@
  *
  * Run: node --import tsx --test server/src/__tests__/agents-orchestrator.test.ts
  */
-import { test, after } from 'node:test'
+import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
+import { randomUUID } from 'node:crypto'
 import { pool } from '../db/pool.js'
+import { ensureSchema } from '../db/migrate.js'
+import { env } from '../env.js'
+import { verifyAgentToken } from '../agents/runtime/jwt.js'
+import { mintAgentRuntimeToken, assignAgentToComputer } from '../agents/computer/registry.js'
 import {
   parsePodHealth,
   stuckPendingReason,
@@ -31,7 +36,67 @@ import {
   type KubectlResult,
 } from '../agents/runtime/orchestrator.js'
 
+// mintManagedRuntimeToken is a NEW export of this repair: resolve it
+// dynamically so a baseline orchestrator module (red tree) fails these tests
+// at the capability assertion instead of an ESM module-link error that would
+// take the whole file down before any test runs. The locally declared shape
+// mirrors the production signature — (agentId, ttlSeconds?) — so calls
+// (including the probe TTL override) type-check without casts.
+interface ManagedMintResult {
+  token: string
+  companyId: string | null
+  computerId: string
+  assignmentVersion: string
+  runtimeKind: 'managed'
+  expiresInSeconds: number
+}
+let mintManagedRuntimeToken: ((agentId: string, ttlSeconds?: number) => Promise<ManagedMintResult | null>) | null = null
+
+/** Type-safe invocation of the dynamically resolved mint. Fails the test
+ *  explicitly (baseline red) when the capability is absent — the guard is a
+ *  never-returning branch, so the narrowed call needs no non-null assertion
+ *  and every later `minted!` becomes a plain property read. */
+async function mintManagedOrNull(agentId: string, ttlSeconds?: number): Promise<ManagedMintResult | null> {
+  if (typeof mintManagedRuntimeToken !== 'function') {
+    assert.fail('the orchestrator/probe mint path must expose its assignment-bound managed mint')
+  }
+  return mintManagedRuntimeToken(agentId, ttlSeconds)
+}
+
 const { yamlQuote, dnsLabelValue, podManifest } = _testing
+
+/** This file's first 57 tests are pure unit tests and historically ran with
+ *  NO database at all — a bare `npm test` uses env.ts's default DATABASE_URL,
+ *  which points at the ordinary application database. The DB-backed managed
+ *  mint cases below must NEVER migrate or write fixtures against that. They
+ *  run only when the target is a VERIFIED synthetic test database: the URL's
+ *  database name itself must contain "test" (same convention the immutable
+ *  integration helpers already use to guard destructive ops). Anything else —
+ *  default URL, a production name — keeps this file purely unit-level and
+ *  skips the DB cases with an explicit reason. */
+function syntheticTestTarget(url: string | undefined): boolean {
+  if (!url) return false
+  try {
+    const u = new URL(url.replace(/^postgres(ql)?:/, 'http:'))
+    const db = decodeURIComponent(u.pathname.replace(/^\//, ''))
+    return db.length > 0 && /test/i.test(db)
+  } catch {
+    return false
+  }
+}
+const dbBacked = syntheticTestTarget(env.DATABASE_URL)
+
+before(async () => {
+  // The managed-mint regressions below need the assignment-version column
+  // + rotation trigger — only ever created on a verified synthetic target.
+  if (dbBacked) {
+    const orch = await import('../agents/runtime/orchestrator.js') as {
+      mintManagedRuntimeToken?: typeof mintManagedRuntimeToken
+    }
+    mintManagedRuntimeToken = orch.mintManagedRuntimeToken ?? null
+    await ensureSchema()
+  }
+})
 
 after(async () => {
   // orchestrator.ts transitively imports inproc-client.ts → redis.ts
@@ -586,4 +651,184 @@ test('planIdlePvcGc: mixed batch picks only the right ones', () => {
   assert.equal(byAgent.get('bram'), 'departed')
   assert.equal(byAgent.get('nova'), 'idle')
   assert.equal(byAgent.get('ghost'), 'orphan')
+})
+
+// ─── assignment-bound managed mint ──────────────────────────────────
+// Both the orchestrator's pod spawn and the manual probe path mint their
+// credential through mintManagedRuntimeToken — a managed token that does
+// NOT carry the observed assignment (cloud computer + opaque persisted
+// version) is exactly the stale-credential gap this repair closes.
+
+async function seedManagedAgent(): Promise<{
+  agentId: string
+  companyId: string
+  computerId: string
+}> {
+  const companyId = `c-${randomUUID().slice(0, 8)}`
+  const computerId = `cloud-${companyId}`
+  const agentId = `a-${randomUUID().slice(0, 8)}`
+  await pool.query(
+    `INSERT INTO companies (id, name, slug, owner_user_id) VALUES ($1, $2, $3, $4)`,
+    [companyId, `Co ${companyId}`, companyId, 'test-owner'],
+  )
+  await pool.query(
+    `INSERT INTO computers (id, company_id, name, kind, available_engines, status)
+       VALUES ($1, $2, 'Cumora Cloud', 'cloud', '["managed"]'::jsonb, 'online')`,
+    [computerId, companyId],
+  )
+  await pool.query(
+    `INSERT INTO participants (id, company_id, kind, name, role, initial, avatar_bg, status, computer_id, engine)
+       VALUES ($1, $2, 'agent', $3, 'tester', $4, '#abcdef', 'avail', $5, 'managed')`,
+    [agentId, companyId, agentId, agentId.slice(0, 1).toUpperCase(), computerId],
+  )
+  return { agentId, companyId, computerId }
+}
+
+test('managed mint carries the observed cloud computer + assignment version', { skip: !dbBacked && 'DB-backed case: requires a verified synthetic test database' }, async () => {
+  const seeded = await seedManagedAgent()
+  const minted = await mintManagedOrNull(seeded.agentId)
+  assert.ok(minted, 'mint must succeed for a cloud-assigned agent')
+  assert.equal(minted!.runtimeKind, 'managed')
+  assert.equal(minted!.computerId, seeded.computerId)
+  assert.ok(typeof minted!.assignmentVersion === 'string' && minted!.assignmentVersion.length > 0)
+  const claims = verifyAgentToken(minted!.token)
+  assert.equal(claims.runtimeKind, 'managed')
+  assert.equal(claims.computerId, seeded.computerId)
+  assert.equal(claims.assignmentVersion, minted!.assignmentVersion,
+    'token claims must pin the observed assignment version')
+})
+
+test('managed mint TTL is caller-controlled — pods keep 24h, the probe pins the historical 1h', { skip: !dbBacked && 'DB-backed case: requires a verified synthetic test database' }, async () => {
+  const seeded = await seedManagedAgent()
+
+  // Default: the pod lifetime.
+  const podMint = await mintManagedOrNull(seeded.agentId)
+  assert.ok(podMint)
+  assert.equal(podMint!.expiresInSeconds, 24 * 60 * 60)
+  const podClaims = verifyAgentToken(podMint!.token)
+  assert.equal(podClaims.exp - podClaims.iat, 24 * 60 * 60)
+
+  // Probe override: the pre-repair CLI minted exp−iat = 3600s.
+  const probeMint = await mintManagedOrNull(seeded.agentId, 60 * 60)
+  assert.ok(probeMint)
+  const probeClaims = verifyAgentToken(probeMint!.token)
+  assert.equal(probeClaims.exp - probeClaims.iat, 3600,
+    'probe credentials keep the historical one-hour shape')
+  // Same observed-assignment binding either way.
+  assert.equal(probeClaims.computerId, seeded.computerId)
+  assert.equal(probeClaims.assignmentVersion, podMint!.assignmentVersion)
+})
+
+test('managed mint refuses agents without a current managed assignment', { skip: !dbBacked && 'DB-backed case: requires a verified synthetic test database' }, async () => {
+  const seeded = await seedManagedAgent()
+  assert.equal(await mintManagedOrNull(`missing-${randomUUID().slice(0, 8)}`), null)
+
+  // Moved to a BYOA host → the probe/orchestrator must NOT mint a managed token.
+  const localId = `local-${randomUUID().slice(0, 8)}`
+  await pool.query(
+    `INSERT INTO computers (id, company_id, name, kind, available_engines, status)
+       VALUES ($1, $2, 'Test Mac', 'local', '["claude"]'::jsonb, 'online')`,
+    [localId, seeded.companyId],
+  )
+  const moved = await assignAgentToComputer({
+    agentId: seeded.agentId, companyId: seeded.companyId, computerId: localId,
+  })
+  assert.ok(moved)
+  assert.equal(await mintManagedOrNull(seeded.agentId), null,
+    'a BYOA-assigned agent must not receive managed credentials')
+
+  // Departed → no mint either.
+  await pool.query(`UPDATE participants SET departed_at = NOW() WHERE id = $1`, [seeded.agentId])
+  assert.equal(await mintAgentRuntimeToken({ agentId: seeded.agentId, computerId: localId }), null)
+})
+
+test('managed A→B rotates the binding — the A credential cannot be re-minted', { skip: !dbBacked && 'DB-backed case: requires a verified synthetic test database' }, async () => {
+  const seeded = await seedManagedAgent()
+  const first = await mintManagedOrNull(seeded.agentId)
+  assert.ok(first)
+
+  const cloudB = `cloud-${randomUUID().slice(0, 8)}`
+  await pool.query(
+    `INSERT INTO computers (id, company_id, name, kind, available_engines, status)
+       VALUES ($1, $2, 'Second Cloud', 'cloud', '["managed"]'::jsonb, 'online')`,
+    [cloudB, seeded.companyId],
+  )
+  const moved = await assignAgentToComputer({
+    agentId: seeded.agentId, companyId: seeded.companyId, computerId: cloudB,
+  })
+  assert.ok(moved)
+  assert.notEqual(moved!.assignmentVersion, first!.assignmentVersion,
+    'managed host move must rotate the persisted assignment version')
+
+  assert.equal(await mintAgentRuntimeToken({ agentId: seeded.agentId, computerId: seeded.computerId }), null,
+    'minting against the OLD cloud host must refuse after the move')
+  const second = await mintManagedOrNull(seeded.agentId)
+  assert.ok(second)
+  assert.equal(second!.computerId, cloudB)
+  assert.notEqual(second!.assignmentVersion, first!.assignmentVersion)
+})
+
+test('managed→local→managed return does not resurrect the original managed credential', { skip: !dbBacked && 'DB-backed case: requires a verified synthetic test database' }, async () => {
+  const seeded = await seedManagedAgent()
+  const original = await mintManagedOrNull(seeded.agentId)
+  assert.ok(original)
+  const originalClaims = verifyAgentToken(original!.token)
+
+  const localId = `local-${randomUUID().slice(0, 8)}`
+  await pool.query(
+    `INSERT INTO computers (id, company_id, name, kind, available_engines, status)
+       VALUES ($1, $2, 'Test Mac', 'local', '["claude"]'::jsonb, 'online')`,
+    [localId, seeded.companyId],
+  )
+  await assignAgentToComputer({ agentId: seeded.agentId, companyId: seeded.companyId, computerId: localId })
+  const back = await assignAgentToComputer({
+    agentId: seeded.agentId, companyId: seeded.companyId, computerId: seeded.computerId,
+  })
+  assert.ok(back)
+  assert.notEqual(back!.assignmentVersion, original!.assignmentVersion,
+    'returning to the SAME cloud computer must still have rotated the version twice')
+
+  const remint = await mintManagedOrNull(seeded.agentId)
+  assert.ok(remint)
+  assert.notEqual(remint!.assignmentVersion, original!.assignmentVersion)
+  // And the ORIGINAL token no longer matches the live assignment:
+  const { runtimeCredentialMatchesAssignment } = await import('../agents/runtime/jwt.js')
+  assert.equal(runtimeCredentialMatchesAssignment(originalClaims, {
+    computerId: remint!.computerId,
+    computerKind: 'cloud',
+    engine: 'managed',
+    assignmentVersion: remint!.assignmentVersion,
+    computerRevoked: false,
+  }), false, 'the pre-move managed credential must not match the post-return assignment')
+})
+
+test('unchanged managed re-assignment is idempotent — version and token stay valid', { skip: !dbBacked && 'DB-backed case: requires a verified synthetic test database' }, async () => {
+  const seeded = await seedManagedAgent()
+  const first = await mintManagedOrNull(seeded.agentId)
+  assert.ok(first)
+  const again = await assignAgentToComputer({
+    agentId: seeded.agentId, companyId: seeded.companyId, computerId: seeded.computerId,
+  })
+  assert.ok(again)
+  assert.equal(again!.assignmentVersion, first!.assignmentVersion,
+    're-assigning the SAME cloud computer must not rotate the version')
+  const second = await mintManagedOrNull(seeded.agentId)
+  assert.ok(second)
+  assert.equal(second!.assignmentVersion, first!.assignmentVersion)
+})
+
+test('departure blocks minting; reactivation mints a fresh assignment version', { skip: !dbBacked && 'DB-backed case: requires a verified synthetic test database' }, async () => {
+  const seeded = await seedManagedAgent()
+  const before = await mintManagedOrNull(seeded.agentId)
+  assert.ok(before)
+
+  await pool.query(`UPDATE participants SET departed_at = NOW() WHERE id = $1`, [seeded.agentId])
+  assert.equal(await mintManagedOrNull(seeded.agentId), null,
+    'a departed agent must not mint runtime credentials')
+
+  await pool.query(`UPDATE participants SET departed_at = NULL WHERE id = $1`, [seeded.agentId])
+  const after = await mintManagedOrNull(seeded.agentId)
+  assert.ok(after, 'reactivation must allow a remint')
+  assert.notEqual(after!.assignmentVersion, before!.assignmentVersion,
+    'reactivation must rotate the version so pre-departure credentials stay dead')
 })

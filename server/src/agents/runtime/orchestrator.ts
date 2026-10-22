@@ -26,7 +26,7 @@ import { env } from '../../env.js'
 import { pool } from '../../db/pool.js'
 import { sub2apiConfigured, sub2apiOpenAIBaseURL } from '../../sub2api.js'
 import { inprocClient } from './inproc-client.js'
-import { signAgentToken } from './jwt.js'
+import { mintAgentRuntimeToken } from '../computer/registry.js'
 import { notifyAlert } from '../../alerting.js'
 import { Semaphore } from '../../concurrency.js'
 
@@ -645,6 +645,58 @@ const inFlight = new Map<string, Promise<EnsurePodResult>>()
  *  callers can retry on the next wake. */
 const ENSURE_POD_WATCHDOG_MS = 180_000
 
+/** A managed runtime token minted against the agent's observed assignment. */
+export interface ManagedRuntimeToken {
+  token: string
+  companyId: string | null
+  computerId: string
+  /** Opaque persisted assignment version observed at mint time. */
+  assignmentVersion: string
+  runtimeKind: 'managed'
+  expiresInSeconds: number
+}
+
+/** Mint the managed pod credential for an agent, bound to the agent's
+ *  OBSERVED assignment: the cloud computer they currently run on plus the
+ *  opaque persisted assignment version. Both the orchestrator's pod spawn
+ *  and the manual probe path go through here so every managed credential in
+ *  circulation is assignment-bound from day one. Returns null when the agent
+ *  has no current managed assignment — BYOA host, departed, revoked cloud
+ *  row, or a legacy unbound row (those require an explicit re-assign before
+ *  a pod can be minted; unbound minting must not succeed fail-open).
+ *  `ttlSeconds` defaults to the pod lifetime (TOKEN_TTL_SECONDS, 24h); the
+ *  probe path passes the historical 1h so its CLI token keeps the exact
+ *  shape `signAgentToken` produced before this repair. */
+export async function mintManagedRuntimeToken(
+  agentId: string,
+  ttlSeconds: number = TOKEN_TTL_SECONDS,
+): Promise<ManagedRuntimeToken | null> {
+  const { rows } = await pool.query<{ computer_id: string | null }>(
+    `SELECT p.computer_id
+       FROM participants p
+       JOIN computers c
+         ON c.id = p.computer_id
+        AND c.company_id = p.company_id
+        AND c.revoked_at IS NULL
+      WHERE p.id = $1 AND p.kind = 'agent' AND p.departed_at IS NULL
+        AND c.kind = 'cloud'
+      LIMIT 1`,
+    [agentId],
+  )
+  const computerId = rows[0]?.computer_id
+  if (!computerId) return null
+  const minted = await mintAgentRuntimeToken({ agentId, computerId, ttlSeconds })
+  if (!minted || minted.runtimeKind !== 'managed') return null
+  return {
+    token: minted.token,
+    companyId: minted.companyId,
+    computerId,
+    assignmentVersion: minted.assignmentVersion,
+    runtimeKind: 'managed',
+    expiresInSeconds: minted.expiresInSeconds,
+  }
+}
+
 /** Idempotent — spin up a Pod for `agentId` if one isn't already
  *  running. Returns a hint about whether we actually created anything
  *  (for log readability).
@@ -786,12 +838,14 @@ async function ensurePodImpl(agentId: string): Promise<EnsurePodResult> {
   const persona = await inprocClient.loadPersona(agentId).catch(() => null)
   if (!persona) return { created: false, ok: false, reason: 'no such agent' }
 
-  const token = signAgentToken({
-    agentId,
-    companyId: persona.companyId,
-    runtimeKind: 'managed',
-    ttlSeconds: TOKEN_TTL_SECONDS,
-  })
+  const minted = await mintManagedRuntimeToken(agentId)
+  if (!minted) {
+    return {
+      created: false, ok: false,
+      reason: 'agent has no current managed computer assignment (moved to BYOA, departed, revoked, or unbound)',
+    }
+  }
+  const token = minted.token
 
   // Resolve the workspace's per-user sub2api key so this pod's LLM
   // traffic counts against that user's quota. Falls back to the

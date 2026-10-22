@@ -1537,6 +1537,25 @@ ALTER TABLE participants ADD COLUMN IF NOT EXISTS engine      TEXT;  -- 'managed
 -- for Claude, ANTHROPIC_SMALL_FAST_MODEL (small).
 ALTER TABLE participants ADD COLUMN IF NOT EXISTS fast_model  TEXT;
 
+-- ============== Assignment-version binding ===========================
+-- Opaque per-agent assignment version. Every runtime credential (managed
+-- pod AND BYOA daemon) is minted against the version observed at mint
+-- time and revalidated against the current one on every request and
+-- before every outgoing wake event. The cumora_agent_assignment_version
+-- trigger (created right after this DDL batch — see ensureSchema) rotates
+-- it whenever an agent's EFFECTIVE assignment changes: host
+-- (computer_id), engine, or the departure/reactivation toggle. Re-assigning
+-- the same host+engine is a no-op and keeps the version, so unchanged
+-- assignments preserve valid work. Because the rotation is persisted,
+-- returning to a previous host (A→B→A) can never revive an older token.
+ALTER TABLE participants ADD COLUMN IF NOT EXISTS assignment_version TEXT;
+-- Backfill: stamp every agent exactly once. Legacy tokens carry no version
+-- claim at all and fail closed at the assignment check regardless, so the
+-- value itself is opaque. Humans never mint runtime credentials.
+UPDATE participants
+   SET assignment_version = 'av-' || gen_random_uuid()::text
+ WHERE kind = 'agent' AND assignment_version IS NULL;
+
 -- Persistent per-company pairing token. Replaces the old short-lived Redis
 -- pairing code so a historical "add a computer" command (--pair <token>)
 -- stays valid forever. Long + high-entropy in lieu of expiry; maps to exactly
@@ -2098,6 +2117,59 @@ export async function ensureSchema(): Promise<void> {
         $migrate$;
       `)
 
+      // ============== Assignment-version rotation trigger ==============
+      //
+      // The persisted participants.assignment_version column (added in the
+      // DDL batch above) must rotate whenever an agent's EFFECTIVE assignment
+      // changes, no matter which code path performs the write — the computer
+      // assignment API, agent off-boarding / re-hiring, admin tooling, or a
+      // future migration. A BEFORE INSERT OR UPDATE trigger is the one place
+      // that observes every path deterministically. Rotation conditions:
+      //   • computer_id changes          (host move, any direction)
+      //   • engine changes               (engine switch on the same host)
+      //   • departed_at NULL↔non-NULL    (departure / reactivation)
+      // An UPDATE that rewrites the same values rotates nothing (idempotent
+      // re-assign keeps valid credentials), and inserts get a fresh version.
+      // Explicit rotation writes (e.g. revokeComputer) pass through: the
+      // trigger only ever replaces a NULL/missing version, never a provided
+      // one.
+      //
+      // ATOMICITY: the function and the trigger are installed by ONE
+      // multi-statement simple-protocol query, which PostgreSQL wraps in a
+      // single implicit transaction — both objects become visible together
+      // or not at all. There is deliberately NO `DROP TRIGGER` + `CREATE
+      // TRIGGER` pair: that would autocommit an interval with the trigger
+      // ABSENT, during which a concurrent assignment write (the advisory
+      // lock only serializes migration-vs-migration, not runtime writes)
+      // could move an agent A→B→A without rotating the version and thereby
+      // revive an old runtime credential. `CREATE OR REPLACE TRIGGER`
+      // (PostgreSQL 14+) swaps the definition in place, so at every instant
+      // either the previous enforcement or the new one is active — never
+      // none. Re-runs are exact no-ops.
+      await client.query(`
+        CREATE OR REPLACE FUNCTION cumora_agent_assignment_version_fn()
+        RETURNS trigger AS $assignment_version$
+        BEGIN
+          IF NEW.kind = 'agent' THEN
+            IF NEW.assignment_version IS NULL
+               OR (TG_OP = 'UPDATE'
+                   AND OLD.kind = 'agent'
+                   AND (
+                        NEW.computer_id IS DISTINCT FROM OLD.computer_id
+                     OR NEW.engine IS DISTINCT FROM OLD.engine
+                     OR (OLD.departed_at IS NULL) IS DISTINCT FROM (NEW.departed_at IS NULL)
+                   )) THEN
+              NEW.assignment_version := 'av-' || gen_random_uuid()::text;
+            END IF;
+          END IF;
+          RETURN NEW;
+        END
+        $assignment_version$ LANGUAGE plpgsql;
+        CREATE OR REPLACE TRIGGER cumora_agent_assignment_version
+          BEFORE INSERT OR UPDATE ON participants
+          FOR EACH ROW EXECUTE FUNCTION cumora_agent_assignment_version_fn();
+      `)
+
       // ============== Agent id global-uniqueness migration ==============
       //
       // The participants table's composite PK `(id, company_id)` was a
@@ -2227,6 +2299,20 @@ async function schemaAlreadyCurrent(client: import('pg').PoolClient): Promise<bo
         -- query in this release. If its DDL rolled back under contention, boot
         -- must retry rather than declaring the older schema current.
         AND (SELECT count(*) FROM pg_class WHERE relname = 'conversation_archives') > 0
+        -- Assignment-version binding: the participants column plus its
+        -- rotation trigger are the latest schema additions. Without these
+        -- sentinels a 40P01 fallback could skip the ALTER + trigger and
+        -- every runtime-credential revalidation would fail closed with
+        -- "column assignment_version does not exist".
+        AND (SELECT count(*) FROM information_schema.columns
+               WHERE table_name = 'participants' AND column_name = 'assignment_version') > 0
+        AND EXISTS (
+          SELECT 1 FROM pg_trigger t
+            JOIN pg_class c ON c.oid = t.tgrelid
+           WHERE c.relname = 'participants'
+             AND t.tgname = 'cumora_agent_assignment_version'
+             AND NOT t.tgisinternal
+        )
         AS ok
     `)
     return rows[0]?.ok === true

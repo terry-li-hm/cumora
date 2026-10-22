@@ -108,6 +108,17 @@ async function getLatestDaemonVersion(): Promise<string | null> {
 
 const AGENT_TOKEN_TTL_SECONDS = 2 * 60 * 60 // 2h; daemon refreshes before expiry
 
+/** Test-only seam for deterministically exercising the revoke/pair race:
+ *  invoked between pairComputer's existing-row LOOKUP and its UPDATE, so a
+ *  test can land a production revokeComputer exactly in the interleave
+ *  window the row guards exist to close. Never set in production. */
+let pairComputerInterleaveForTesting: ((computerId: string, companyId: string) => Promise<void>) | null = null
+export function __setPairComputerInterleaveForTesting(
+  fn: ((computerId: string, companyId: string) => Promise<void>) | null,
+): void {
+  pairComputerInterleaveForTesting = fn
+}
+
 function hashToken(token: string): string {
   return createHash('sha256').update(token).digest('base64url')
 }
@@ -215,16 +226,21 @@ export async function pairComputer(args: {
   )
   if (exact.rows[0]) {
     const { id, company_id: companyId } = exact.rows[0]
-    await pool.query(
+    if (pairComputerInterleaveForTesting) await pairComputerInterleaveForTesting(id, companyId)
+    // revoked_at re-checked IN the UPDATE: a revoke that lands between the
+    // SELECT above and this write must win — pairing fails closed instead of
+    // grafting a fresh device credential onto a revoked computer.
+    const reattach = await pool.query(
       `UPDATE computers
           SET credential_hash = $1, available_engines = $2::jsonb,
               name = COALESCE(NULLIF($3, ''), name),
               daemon_version = COALESCE($5, daemon_version),
               daemon_supervised = COALESCE($6, daemon_supervised),
               status = 'online', last_seen_at = NOW(), paired_at = NOW()
-        WHERE id = $4`,
+        WHERE id = $4 AND revoked_at IS NULL`,
       [hashToken(deviceToken), JSON.stringify(engines), reportedName, id, version, supervised],
     )
+    if (!reattach.rowCount) return null
     if (!args.deferBroadcast) await broadcastComputerStatus(id, companyId, 'online')
     return { computerId: id, companyId, deviceToken }
   }
@@ -240,6 +256,10 @@ export async function pairComputer(args: {
   // Re-attach if a non-cloud computer with this hostname already exists in the
   // company — a re-run of the (now persistent) command from the same machine.
   // Re-mint the device token + refresh engines/status; never create a duplicate.
+  // The revoked_at guard lives IN the UPDATE (not just the SELECT) and the
+  // write never clears revoked_at: a revocation that lands between lookup and
+  // write must win — pairing fails closed rather than silently resurrecting a
+  // revoked computer with a fresh credential.
   const existing = await pool.query<{ id: string }>(
     `SELECT id FROM computers
        WHERE company_id = $1 AND kind <> 'cloud' AND revoked_at IS NULL AND name = $2
@@ -248,15 +268,17 @@ export async function pairComputer(args: {
   )
   if (existing.rows[0]) {
     const id = existing.rows[0].id
-    await pool.query(
+    if (pairComputerInterleaveForTesting) await pairComputerInterleaveForTesting(id, companyId)
+    const reattach = await pool.query(
       `UPDATE computers
           SET credential_hash = $1, available_engines = $2::jsonb,
               daemon_version = COALESCE($4, daemon_version),
               daemon_supervised = COALESCE($5, daemon_supervised),
-              status = 'online', last_seen_at = NOW(), paired_at = NOW(), revoked_at = NULL
-        WHERE id = $3`,
+              status = 'online', last_seen_at = NOW(), paired_at = NOW()
+        WHERE id = $3 AND revoked_at IS NULL`,
       [hashToken(deviceToken), JSON.stringify(engines), id, version, supervised],
     )
+    if (!reattach.rowCount) return null
     if (!args.deferBroadcast) await broadcastComputerStatus(id, companyId, 'online')
     return { computerId: id, companyId, deviceToken }
   }
@@ -322,27 +344,62 @@ export async function resolveDevice(token: string): Promise<{ computerId: string
   return { computerId: rows[0].id, companyId: rows[0].company_id }
 }
 
-/** Mint a short-lived per-agent runtime JWT for a paired device — but only if
- *  the agent is actually assigned to that device's computer (same company).
- *  This is the credential the daemon uses for the agent's wake-stream SSE and
- *  as CUMORA_AGENT_RUNTIME_TOKEN for the `cumora` shim. */
+/** Mint a short-lived per-agent runtime JWT bound to the agent's OBSERVED
+ *  assignment — but only if the agent is currently assigned to that exact
+ *  computer (same company, not departed, computer not revoked, and a
+ *  persisted assignment version present). The token carries the computer id
+ *  and the opaque assignment version, so every later revalidation can reject
+ *  it after any effective assignment change. Works for paired BYOA hosts AND
+ *  for the managed cloud computer (runtimeKind is derived from the computer's
+ *  kind, never trusted from the caller). This is the credential the daemon
+ *  uses for the agent's wake-stream SSE and as CUMORA_AGENT_RUNTIME_TOKEN for
+ *  the `cumora` shim. */
 export async function mintAgentRuntimeToken(args: {
   computerId: string
   agentId: string
-}): Promise<{ token: string; expiresInSeconds: number } | null> {
-  const { rows } = await pool.query<{ company_id: string | null }>(
-    `SELECT company_id FROM participants
-      WHERE id = $1 AND kind = 'agent' AND computer_id = $2 LIMIT 1`,
+  ttlSeconds?: number
+}): Promise<{
+  token: string
+  expiresInSeconds: number
+  runtimeKind: 'managed' | 'byoa'
+  companyId: string | null
+  /** Opaque persisted assignment version observed at mint time. */
+  assignmentVersion: string
+} | null> {
+  const { rows } = await pool.query<{
+    company_id: string | null
+    assignment_version: string | null
+    kind: ComputerKind | null
+  }>(
+    `SELECT p.company_id, p.assignment_version, c.kind
+       FROM participants p
+       JOIN computers c
+         ON c.id = p.computer_id
+        AND c.company_id = p.company_id
+        AND c.revoked_at IS NULL
+      WHERE p.id = $1 AND p.kind = 'agent' AND p.computer_id = $2
+        AND p.departed_at IS NULL
+        AND p.assignment_version IS NOT NULL
+      LIMIT 1`,
     [args.agentId, args.computerId],
   )
-  if (!rows[0]) return null
+  const row = rows[0]
+  if (!row) return null
   const token = signAgentToken({
     agentId: args.agentId,
-    companyId: rows[0].company_id,
-    runtimeKind: 'byoa',
-    ttlSeconds: AGENT_TOKEN_TTL_SECONDS,
+    companyId: row.company_id,
+    runtimeKind: row.kind === 'cloud' ? 'managed' : 'byoa',
+    computerId: args.computerId,
+    assignmentVersion: row.assignment_version!,
+    ttlSeconds: args.ttlSeconds ?? AGENT_TOKEN_TTL_SECONDS,
   })
-  return { token, expiresInSeconds: AGENT_TOKEN_TTL_SECONDS }
+  return {
+    token,
+    expiresInSeconds: args.ttlSeconds ?? AGENT_TOKEN_TTL_SECONDS,
+    runtimeKind: row.kind === 'cloud' ? 'managed' : 'byoa',
+    companyId: row.company_id,
+    assignmentVersion: row.assignment_version!,
+  }
 }
 
 /** Agents assigned to a computer — the daemon's discovery list on boot.
@@ -435,14 +492,17 @@ export function isByoaKind(kind: ComputerKind | null): boolean {
 /** Assign an agent to a computer (move it between Cumora Cloud and a paired
  *  machine). Resolves the engine: 'managed' for cloud, else the requested
  *  engine if the computer advertises it, else the computer's first engine.
- *  Returns the resolved { kind, engine } or null if the computer/agent is
- *  invalid for this company. */
+ *  Returns the resolved { kind, engine, assignmentVersion } or null if the
+ *  computer/agent is invalid for this company. The persisted assignment
+ *  version rotates ONLY when the effective assignment actually changes
+ *  (host or engine) — re-assigning the same values is idempotent and keeps
+ *  the current version, so unchanged assignments preserve valid tokens. */
 export async function assignAgentToComputer(args: {
   agentId: string
   companyId: string
   computerId: string
   engine?: string
-}): Promise<{ kind: ComputerKind; engine: EngineId } | null> {
+}): Promise<{ kind: ComputerKind; engine: EngineId; assignmentVersion: string } | null> {
   const { rows } = await pool.query<{ kind: ComputerKind; available_engines: string[] }>(
     `SELECT kind, available_engines FROM computers
       WHERE id = $1 AND company_id = $2 AND revoked_at IS NULL LIMIT 1`,
@@ -462,24 +522,45 @@ export async function assignAgentToComputer(args: {
     engine = pick
   }
 
-  const { rowCount } = await pool.query(
+  const { rows: updated } = await pool.query<{ assignment_version: string | null }>(
     `UPDATE participants SET computer_id = $1, engine = $2
-      WHERE id = $3 AND company_id = $4 AND kind = 'agent'`,
+      WHERE id = $3 AND company_id = $4 AND kind = 'agent'
+      RETURNING assignment_version`,
     [args.computerId, engine, args.agentId, args.companyId],
   )
-  if (!rowCount) return null
-  return { kind: computer.kind, engine }
+  if (!updated[0]) return null
+  return { kind: computer.kind, engine, assignmentVersion: updated[0].assignment_version ?? '' }
 }
 
 /** Revoke a paired computer: the device token + every derived agent JWT stop
- *  working, and its agents go offline. Cloud computers cannot be revoked. */
+ *  working, and its agents go offline. Cloud computers cannot be revoked.
+ *  The revocation AND the assignment-version rotation of every agent still on
+ *  that computer happen in ONE statement (data-modifying CTE, one atomic
+ *  commit): no concurrent operation can ever observe the computer revoked
+ *  while its agents keep the pre-revocation version — the window in which a
+ *  racing re-pair (or any other path) could pair against stale credentials is
+ *  closed by making the two writes inseparable. */
 export async function revokeComputer(args: { computerId: string; companyId: string }): Promise<boolean> {
-  const { rowCount } = await pool.query(
-    `UPDATE computers SET revoked_at = NOW(), status = 'offline', credential_hash = NULL
-      WHERE id = $1 AND company_id = $2 AND kind <> 'cloud' AND revoked_at IS NULL`,
+  // The success boolean is derived from the REVOKED-computers CTE, never from
+  // the outer participants rotation: a non-cloud computer with NO assigned
+  // agents is still genuinely revoked (and must broadcast offline), while a
+  // repeat-revoke of an already-revoked row revoked nothing and must stay
+  // false. Both writes remain one atomic statement.
+  const { rows } = await pool.query<{ didRevoke: boolean }>(
+    `WITH revoked AS (
+       UPDATE computers SET revoked_at = NOW(), status = 'offline', credential_hash = NULL
+        WHERE id = $1 AND company_id = $2 AND kind <> 'cloud' AND revoked_at IS NULL
+       RETURNING id
+     ), rotated AS (
+       UPDATE participants SET assignment_version = 'av-' || gen_random_uuid()::text
+        WHERE computer_id = $1 AND company_id = $2 AND kind = 'agent'
+          AND EXISTS (SELECT 1 FROM revoked)
+       RETURNING 1
+     )
+     SELECT EXISTS (SELECT 1 FROM revoked) AS "didRevoke"`,
     [args.computerId, args.companyId],
   )
-  if (!rowCount) return false
+  if (rows[0]?.didRevoke !== true) return false
   await broadcastComputerStatus(args.computerId, args.companyId, 'offline')
   return true
 }

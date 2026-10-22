@@ -38,6 +38,8 @@ import {
 } from '../agents/runtime/wake-bus.js'
 import { busyKey, isAgentBusy } from '../agents/runtime/inproc-client.js'
 import { wakeAgent, _resetSteerRateForTests } from '../agents/scheduler.js'
+import { verifyAgentToken } from '../agents/runtime/jwt.js'
+import { mintAgentRuntimeToken, assignAgentToComputer } from '../agents/computer/registry.js'
 
 before(async () => {
   await ensureSchemaOnce()
@@ -340,7 +342,8 @@ test('[integration] steer (verbatim path): mid-turn message lands in next hop in
 /** Minimal Express-Response stub for attachWakeStream. Captures every
  *  `write()` call so the test can assert on the SSE frames the
  *  pod would have received. Mixes in EventEmitter so the close/error
- *  events the wake-bus listens for still work. */
+ *  events the wake-bus listens for still work. `end()` mirrors a real
+ *  response closing the socket (the bus ends stale/overflowed streams). */
 function makeFakeSseResponse(): Response & {
   written: string[]
   closed: boolean
@@ -355,9 +358,64 @@ function makeFakeSseResponse(): Response & {
     setHeader: (k: string, v: string) => { headers[k] = v },
     flushHeaders: () => { /* noop */ },
     write: (s: string) => { if (!fake.closed) written.push(s); return true },
+    end: () => { fake.closed = true },
     triggerClose: () => { fake.closed = true; ee.emit('close') },
   }) as unknown as Response & { written: string[]; closed: boolean; triggerClose: () => void }
   return fake
+}
+
+/** Always-valid stream auth for tests that exercise pure bus plumbing
+ *  (identical shape on pre-binding wake-buses — the third attach arg is
+ *  simply ignored there). */
+function alwaysValidStreamAuth(): { expiresAtMs: number; revalidate: () => boolean } {
+  return { expiresAtMs: Date.now() + 60_000, revalidate: () => true }
+}
+
+/** Attach-auth built from the PRODUCTION revalidation closure the runtime
+ * server uses on /runtime/wake-stream — resolved dynamically so a baseline
+ * (pre-binding) server fails these tests on the missing capability instead
+ * of a module link error. */
+async function productionStreamAuth(token: string): Promise<{
+  expiresAtMs: number
+  revalidate: () => boolean | Promise<boolean>
+}> {
+  const { wakeStreamAuthForClaims } = await import('../agents/runtime/server.js')
+  assert.equal(typeof wakeStreamAuthForClaims, 'function',
+    'the runtime server must expose its production wake-stream revalidation closure')
+  return wakeStreamAuthForClaims(verifyAgentToken(token))
+}
+
+/** Seed a real BYOA-assigned agent + mint its runtime credential through
+ *  the production registry mint. The wire tests below attach with the
+ *  PRODUCTION revalidation closure (wakeStreamAuthForClaims), so every
+ *  delivered event re-checks company/assignment/revocation/departure/expiry
+ *  against live DB state — exactly like a real daemon stream. */
+async function seedByoaWakeAgent(): Promise<{
+  agentId: string
+  companyId: string
+  computerId: string
+  token: string
+}> {
+  const companyId = `c-${randomUUID().slice(0, 8)}`
+  const agentId = `agent-${randomUUID().slice(0, 8)}`
+  const computerId = `local-${randomUUID().slice(0, 8)}`
+  await pool.query(
+    `INSERT INTO companies (id, name, slug, owner_user_id) VALUES ($1, $2, $3, $4)`,
+    [companyId, `Co ${companyId}`, companyId, 'test-owner'],
+  )
+  await pool.query(
+    `INSERT INTO computers (id, company_id, name, kind, available_engines, status)
+       VALUES ($1, $2, 'Test Mac', 'local', '["claude"]'::jsonb, 'online')`,
+    [computerId, companyId],
+  )
+  await pool.query(
+    `INSERT INTO participants (id, company_id, kind, name, role, initial, avatar_bg, status, computer_id, engine)
+       VALUES ($1, $2, 'agent', $3, 'tester', $4, '#abcdef', 'avail', $5, 'claude')`,
+    [agentId, companyId, agentId, agentId.slice(0, 1).toUpperCase(), computerId],
+  )
+  const minted = await mintAgentRuntimeToken({ agentId, computerId })
+  assert.ok(minted, 'BYOA seed mint must carry the observed assignment')
+  return { agentId, companyId, computerId, token: minted!.token }
 }
 
 /** Parse SSE blocks from a sequence of `write()` payloads. Mirrors
@@ -385,7 +443,7 @@ function parseSseFrames(writes: string[]): Array<{ event?: string; data?: string
 test('[integration] wire: deliverSteer publishes via Redis pubsub → wake-bus SSE → fake subscriber', async () => {
   const agentId = `agent-${randomUUID().slice(0, 8)}`
   const res = makeFakeSseResponse()
-  await attachWakeStream(agentId, res)
+  await attachWakeStream(agentId, res, alwaysValidStreamAuth())
 
   // Small wait so the Redis SUBSCRIBE round-trip completes before we
   // publish; otherwise the publish reaches no subscriber and the test
@@ -422,9 +480,11 @@ test('[integration] wire: deliverSteer publishes via Redis pubsub → wake-bus S
 })
 
 test('[integration] wire: scheduler.wakeAgent routes BOTH wake AND steer when agent is busy', async () => {
-  const agentId = `agent-${randomUUID().slice(0, 8)}`
+  const seeded = await seedByoaWakeAgent()
+  const agentId = seeded.agentId
+  const auth = await productionStreamAuth(seeded.token)
   const res = makeFakeSseResponse()
-  await attachWakeStream(agentId, res)
+  await attachWakeStream(agentId, res, auth)
   await new Promise((r) => setTimeout(r, 100))
 
   // Set the busy lease the scheduler checks. 30s is plenty for the
@@ -453,9 +513,11 @@ test('[integration] wire: scheduler.wakeAgent routes BOTH wake AND steer when ag
 })
 
 test('[integration] wire: scheduler.wakeAgent does NOT deliver steer when agent is idle', async () => {
-  const agentId = `agent-${randomUUID().slice(0, 8)}`
+  const seeded = await seedByoaWakeAgent()
+  const agentId = seeded.agentId
+  const auth = await productionStreamAuth(seeded.token)
   const res = makeFakeSseResponse()
-  await attachWakeStream(agentId, res)
+  await attachWakeStream(agentId, res, auth)
   await new Promise((r) => setTimeout(r, 100))
 
   // No busy lease set → agent reads as idle.
@@ -478,6 +540,284 @@ test('[integration] wire: scheduler.wakeAgent does NOT deliver steer when agent 
   )
 
   res.triggerClose()
+})
+
+// ── Fix: attachment during the in-flight FINAL unsubscribe race ──────
+//
+// The last subscriber's teardown runs an awaited final unsubscribe of the
+// agent's Redis channel. A pod reconnecting in that window must never be
+// told `ready` while the channel subscription is being torn down — it would
+// silently miss every subsequent wake. The bus serializes channel
+// transitions: the new attach WAITS for the final unsubscribe to settle,
+// then re-subscribes, and only then signals ready. Reproduced here
+// deterministically via the unsubscribe gate hook.
+test('[integration] wire: attach during in-flight final unsubscribe waits for the transition, then re-subscribes', async () => {
+  const bus = await import('../agents/runtime/wake-bus.js')
+  const hooks = bus as unknown as {
+    __setWakeUnsubscribeOverrideForTesting?: (fn: ((channel: string) => Promise<void>) | null) => void
+  }
+  assert.equal(typeof hooks.__setWakeUnsubscribeOverrideForTesting, 'function',
+    'wake-bus must serialize the final unsubscribe against new attaches (deterministic transition hook required)')
+  const seeded = await seedByoaWakeAgent()
+  const auth = await productionStreamAuth(seeded.token)
+
+  const res1 = makeFakeSseResponse()
+  await bus.attachWakeStream(seeded.agentId, res1, auth)
+  await new Promise((r) => setTimeout(r, 100))
+
+  // Hold the FINAL unsubscribe in flight — the reconnect happens strictly
+  // inside the teardown window. The try/finally guarantees the gate is
+  // released + hooks cleared even when an assertion fails mid-race.
+  let releaseUnsubscribe!: () => void
+  const gate = new Promise<void>((resolve) => { releaseUnsubscribe = resolve })
+  let unsubscribed = false
+  hooks.__setWakeUnsubscribeOverrideForTesting!(async () => { await gate; unsubscribed = true })
+
+  let res2: ReturnType<typeof makeFakeSseResponse> | null = null
+  try {
+    res1.triggerClose() // last subscriber leaves → final unsubscribe starts (gated)
+    await new Promise((r) => setTimeout(r, 50))
+    assert.equal(unsubscribed, false, 'precondition: the final unsubscribe is still in flight')
+
+    // Reconnect NOW, mid-teardown. The attach must not resolve — and must not
+    // write `ready` — until the unsubscribe has settled.
+    res2 = makeFakeSseResponse()
+    const attach2 = bus.attachWakeStream(seeded.agentId, res2, auth)
+    attach2.catch(() => { /* no unhandled rejection when assertions fail mid-race */ })
+    await new Promise((r) => setTimeout(r, 100))
+    assert.equal(
+      res2.written.some((w) => w.includes('event: ready')),
+      false,
+      'ready must NOT be signalled while the final unsubscribe is still settling',
+    )
+
+    releaseUnsubscribe()
+    await attach2
+    await new Promise((r) => setTimeout(r, 100))
+
+    // The re-subscribed stream must actually receive events — the whole point
+    // of waiting for the transition.
+    const delivered = await bus.deliverSteer(seeded.agentId, {
+      conversationId: 'c-race',
+      messageId: 'm-race',
+      authorName: 'dana',
+      body: 'reconnected during final unsubscribe',
+    })
+    assert.ok(delivered >= 1, 'the post-race re-subscribed stream must accept events')
+    const frames = parseSseFrames(res2.written)
+    assert.ok(frames.some((f) => f.event === 'steer'),
+      'the reconnected subscriber must receive the steer after the race window')
+  } finally {
+    // Close EVERY stream + release the gate + clear the hooks even when an
+    // assertion fails, so negative controls terminate with actual counts.
+    releaseUnsubscribe()
+    res2?.triggerClose()
+    hooks.__setWakeUnsubscribeOverrideForTesting?.(null)
+  }
+})
+
+// ── Fix: no authorized stream accepts → publisher falls back ─────────
+//
+// deliver() reports how many streams ACCEPTED the event after
+// revalidation. Zero accepting streams (here: the only subscriber's
+// credential went stale via reassignment) must return 0 so the scheduler
+// falls back — never a phantom "delivered" from a bare pubsub count.
+test('[integration] wire: no authorized stream accepts → deliver returns 0 and the publisher falls back', async () => {
+  const seeded = await seedByoaWakeAgent()
+  const auth = await productionStreamAuth(seeded.token)
+  const res = makeFakeSseResponse()
+  await attachWakeStream(seeded.agentId, res, auth)
+  await new Promise((r) => setTimeout(r, 100))
+
+  // Sanity: the healthy stream accepts.
+  const before = await deliverSteer(seeded.agentId, {
+    conversationId: 'c-fallback', messageId: 'm-before', authorName: 'erin', body: 'pre-move',
+  })
+  assert.ok(before >= 1, 'healthy authorized stream accepts the event')
+
+  // Reassign the agent to a different host — the open stream's credential
+  // is now stale and must not accept any further events.
+  const computerB = `local-${randomUUID().slice(0, 8)}`
+  await pool.query(
+    `INSERT INTO computers (id, company_id, name, kind, available_engines, status)
+       VALUES ($1, $2, 'Second Mac', 'local', '["claude"]'::jsonb, 'online')`,
+    [computerB, seeded.companyId],
+  )
+  const moved = await assignAgentToComputer({
+    agentId: seeded.agentId, companyId: seeded.companyId, computerId: computerB,
+  })
+  assert.ok(moved)
+
+  const delivered = await deliverSteer(seeded.agentId, {
+    conversationId: 'c-fallback', messageId: 'm-after', authorName: 'erin', body: 'post-move',
+  })
+  assert.equal(delivered, 0,
+    'no authorized stream accepted the event — deliver must report 0 so the publisher falls back')
+  assert.equal(res.closed, true, 'the stale stream must be closed by the failed revalidation')
+  assert.equal(
+    parseSseFrames(res.written).some((f) => f.event === 'steer' && JSON.parse(f.data ?? '{}').messageId === 'm-after'),
+    false,
+    'the stale event payload must not be written to the stream',
+  )
+})
+
+// ── Fix: expiry must be re-checked AFTER the awaited revalidation ─────
+//
+// The pre-event credential check used to test Date.now() only BEFORE the
+// (DB-backed, potentially slow) assignment lookup. A credential that expires
+// WHILE the lookup is in flight would still have its event written. The bus
+// now re-checks expiry at the write boundary; this regression drives a
+// revalidation that resolves true strictly after the credential expired.
+test('[integration] wire: credential expiring during a slow revalidation is rejected at the write boundary', async () => {
+  const seeded = await seedByoaWakeAgent()
+  const res = makeFakeSseResponse()
+  // Expire ~1.2s out; the revalidation deliberately takes 1.5s and returns
+  // true — only the write-boundary expiry re-check can reject this event.
+  const auth = {
+    expiresAtMs: Date.now() + 1_200,
+    revalidate: async (): Promise<boolean> => {
+      await new Promise((r) => setTimeout(r, 1_500))
+      return true
+    },
+  }
+  await attachWakeStream(seeded.agentId, res, auth)
+  await new Promise((r) => setTimeout(r, 100))
+  try {
+    const delivered = await deliverSteer(seeded.agentId, {
+      conversationId: 'c-expiry', messageId: 'm-slow-lookup', authorName: 'grace', body: 'slow lookup',
+    })
+    assert.equal(delivered, 0,
+      'no authorized stream may accept an event whose credential expired during the awaited lookup')
+    assert.equal(res.closed, true, 'the expired stream must be closed')
+    assert.equal(
+      parseSseFrames(res.written).some((f) => f.event === 'steer'),
+      false,
+      'the event payload must not be written after expiry',
+    )
+  } finally {
+    res.triggerClose()
+  }
+})
+
+// ── Fix: a HELD-REJECTING final unsubscribe concurrent with a new attach ─
+//
+// If the last subscriber's final unsubscribe FAILS while a new attach is
+// parked on the same channel, the channel state must not be orphaned: the
+// attach re-subscribes the SAME state, signals ready, and the message
+// handler must still find it so events flow. (The pre-fix catch deleted the
+// map entry unconditionally, leaving a ready stream that acked zero.)
+test('[integration] wire: rejected final unsubscribe under a new attach does not orphan the channel', async () => {
+  const bus = await import('../agents/runtime/wake-bus.js')
+  const hooks = bus as unknown as {
+    __setWakeUnsubscribeOverrideForTesting?: (fn: ((channel: string) => Promise<void>) | null) => void
+  }
+  assert.equal(typeof hooks.__setWakeUnsubscribeOverrideForTesting, 'function',
+    'wake-bus must expose the deterministic unsubscribe-failure hook')
+  const seeded = await seedByoaWakeAgent()
+  const auth = await productionStreamAuth(seeded.token)
+
+  const res1 = makeFakeSseResponse()
+  await bus.attachWakeStream(seeded.agentId, res1, auth)
+  await new Promise((r) => setTimeout(r, 100))
+
+  let releaseGate!: () => void
+  const gate = new Promise<void>((resolve) => { releaseGate = resolve })
+  hooks.__setWakeUnsubscribeOverrideForTesting!(async () => {
+    await gate
+    throw new Error('redis unsubscribe failed (injected)')
+  })
+
+  let res2: ReturnType<typeof makeFakeSseResponse> | null = null
+  try {
+    res1.triggerClose() // last subscriber leaves → final unsubscribe starts (gated)
+    await new Promise((r) => setTimeout(r, 50))
+
+    // Reconnect while the failing teardown is in flight.
+    res2 = makeFakeSseResponse()
+    const attach2 = bus.attachWakeStream(seeded.agentId, res2, auth)
+    attach2.catch(() => { /* no unhandled rejection when assertions fail mid-race */ })
+    await new Promise((r) => setTimeout(r, 100))
+    releaseGate() // the unsubscribe now REJECTS under the parked attach
+    await attach2
+    await new Promise((r) => setTimeout(r, 100))
+
+    // The channel must NOT be orphaned: the re-subscribed stream both
+    // signalled ready AND actually receives events through the bus's message
+    // handler (which can only find a channel still present in the map).
+    assert.ok(res2.written.some((w) => w.includes('event: ready')),
+      'the attach must complete with ready after the failed teardown settles')
+    const delivered = await bus.deliverSteer(seeded.agentId, {
+      conversationId: 'c-orphan', messageId: 'm-orphan', authorName: 'hana', body: 'after failed teardown',
+    })
+    assert.ok(delivered >= 1,
+      'the post-failure re-subscribed channel must be found by the message handler and accept events')
+    assert.ok(parseSseFrames(res2.written).some((f) => f.event === 'steer'),
+      'the reconnected subscriber must receive the steer payload')
+  } finally {
+    // Close EVERY stream + release the gate + clear the hooks even when an
+    // assertion fails, so negative controls terminate with actual counts.
+    releaseGate()
+    res2?.triggerClose()
+    hooks.__setWakeUnsubscribeOverrideForTesting?.(null)
+  }
+})
+
+// ── Fix: burst/concurrency semantics of the revalidation queue ───────
+//
+// Every event now revalidates before delivery. A burst beyond
+// WAKE_REVALIDATION_QUEUE_MAX_EVENTS must stay bounded: every deliver
+// resolves (no unbounded retention of caller-controlled payloads), the
+// overflowing subscriber is closed so it can reconnect + re-drain the
+// durable inbox, and the channel immediately recovers for a fresh stream.
+test('[integration] wire: burst beyond the revalidation queue cap is bounded and recovers', async () => {
+  const seeded = await seedByoaWakeAgent()
+  let revalidations = 0
+  // Slow (DB-shaped) revalidation: the burst arrives far faster than the
+  // serial re-checks complete, so pending deliveries genuinely accumulate —
+  // the condition the queue cap exists to bound.
+  const auth = {
+    expiresAtMs: Date.now() + 60_000,
+    revalidate: async (): Promise<boolean> => {
+      await new Promise((r) => setTimeout(r, 10))
+      revalidations++
+      return true
+    },
+  }
+  const res = makeFakeSseResponse()
+  await attachWakeStream(seeded.agentId, res, auth)
+  await new Promise((r) => setTimeout(r, 100))
+
+  try {
+    const BURST = 70 // 6 above the 64-event queue cap
+    const results = await Promise.all(Array.from({ length: BURST }, (_, i) =>
+      deliverSteer(seeded.agentId, {
+        conversationId: 'c-burst', messageId: `m-burst-${i}`, authorName: 'frank', body: `burst ${i}`,
+      })))
+
+    assert.equal(results.length, BURST, 'every burst deliver must resolve — nothing may hang')
+    assert.ok(results.some((r) => r === 0),
+      'events beyond the queue cap must be rejected (zero accepting streams) instead of retained unboundedly')
+    assert.ok(revalidations >= 1, 'revalidation actually ran before deliveries')
+    assert.equal(res.closed, true,
+      'the overflowing subscriber is closed so it reconnects and re-drains the durable inbox')
+
+    // The channel must recover immediately for a fresh subscriber.
+    const res2 = makeFakeSseResponse()
+    await attachWakeStream(seeded.agentId, res2, alwaysValidStreamAuth())
+    await new Promise((r) => setTimeout(r, 100))
+    try {
+      const after = await deliverSteer(seeded.agentId, {
+        conversationId: 'c-burst', messageId: 'm-recovered', authorName: 'frank', body: 'after burst',
+      })
+      assert.ok(after >= 1, 'a fresh subscriber accepts events right after the overflow close')
+    } finally {
+      res2.triggerClose()
+    }
+  } finally {
+    // Deterministic teardown even when an assertion fails mid-test: the
+    // subscribe/ping handles must never outlive the test process.
+    res.triggerClose()
+  }
 })
 
 // ── Fix #3: summarizer path (batch > SUMMARIZE_THRESHOLD) ─────────────
@@ -795,7 +1135,7 @@ test('[integration] real HTTP wire: parseSseStream consumes attachWakeStream out
 
   const app = expressMod.default()
   const agentId = `agent-${randomUUID().slice(0, 8)}`
-  app.get('/wake-stream', (req, res) => { void attachWakeStream(agentId, res as unknown as Response) })
+  app.get('/wake-stream', (req, res) => { void attachWakeStream(agentId, res as unknown as Response, alwaysValidStreamAuth()) })
 
   const server = createServer(app)
   await new Promise<void>((r) => server.listen(0, () => r()))
@@ -855,10 +1195,11 @@ test('[integration] real HTTP wire: parseSseStream consumes attachWakeStream out
 })
 
 test('[integration] rate limit: scheduler drops steers past 30/min — wake still fires', async () => {
-  const agentId = `agent-${randomUUID().slice(0, 8)}`
+  const seeded = await seedByoaWakeAgent()
+  const agentId = seeded.agentId
   await _resetSteerRateForTests(agentId)
   const res = makeFakeSseResponse()
-  await attachWakeStream(agentId, res)
+  await attachWakeStream(agentId, res, await productionStreamAuth(seeded.token))
   await new Promise((r) => setTimeout(r, 100))
   await redis.set(busyKey(agentId), String(Date.now()), 'EX', 30)
 

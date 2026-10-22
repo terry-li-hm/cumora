@@ -3,8 +3,11 @@
  * routes wake events to the right agent's pod.
  *
  * Model (pod-only):
- *   1. Try deliverWake() — push SSE event to the agent's on-bus Pod
- *   2. If 0 subscribers, the Pod is `resting`. ensurePod() spins one
+ *   1. Try deliverWake() — push SSE event to the agent's on-bus Pod.
+ *      The bus revalidates the subscriber's runtime credential (company,
+ *      assignment version, computer revocation, departure, expiry) before
+ *      EVERY event, and reports how many streams ACCEPTED it.
+ *   2. If no stream accepts it, the Pod is `resting`. ensurePod() spins one
  *      up; the Pod, after SSE attach, runs drain() unconditionally
  *      to catch up the inbox (so we don't need to queue the wake
  *      server-side — the missed event self-heals through the
